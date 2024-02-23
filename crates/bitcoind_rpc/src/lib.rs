@@ -9,6 +9,8 @@
 //! mempool.
 #![warn(missing_docs)]
 
+pub mod compact_filter;
+
 use bdk_chain::{local_chain::CheckPoint, BlockId};
 use bitcoin::{block::Header, Block, BlockHash, Transaction};
 pub use bitcoincore_rpc;

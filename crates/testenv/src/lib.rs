@@ -7,16 +7,19 @@ use bdk_chain::{
     local_chain::CheckPoint,
     BlockId,
 };
-use bitcoincore_rpc::{
-    bitcoincore_rpc_json::{GetBlockTemplateModes, GetBlockTemplateRules},
-    RpcApi,
+use electrsd::{
+    bitcoind::bitcoincore_rpc::{
+        json::{GetBlockTemplateModes, GetBlockTemplateRules},
+        RpcApi,
+    },
+    electrum_client::ElectrumApi,
 };
+
 pub use electrsd;
 pub use electrsd::bitcoind;
 pub use electrsd::bitcoind::anyhow;
 pub use electrsd::bitcoind::bitcoincore_rpc;
 pub use electrsd::electrum_client;
-use electrsd::electrum_client::ElectrumApi;
 use std::time::Duration;
 
 /// Struct for running a regtest environment with a single `bitcoind` node with an `electrs`
