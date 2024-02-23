@@ -26,3 +26,6 @@ anyhow = { version = "1" }
 default = ["std"]
 std = ["bitcoin/std", "bdk_chain/std"]
 serde = ["bitcoin/serde", "bdk_chain/serde"]
+
+[[example]]
+name = "compact_filter"

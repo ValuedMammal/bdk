@@ -10,6 +10,12 @@ use bitcoincore_rpc::{
 use electrsd::electrum_client::ElectrumApi;
 use std::time::Duration;
 
+// TODO: fix this on master
+pub use {
+    anyhow,
+    electrsd::{self, bitcoind},
+};
+
 /// Struct for running a regtest environment with a single `bitcoind` node with an `electrs`
 /// instance connected to it.
 pub struct TestEnv {
