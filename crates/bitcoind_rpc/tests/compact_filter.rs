@@ -130,7 +130,7 @@ fn test_sync() -> Result<()> {
     let compact_filter::Update {
         tip,
         indexed_tx_graph,
-    } = client.sync(false)?;
+    } = client.sync()?;
 
     // Apply updates
     let _ = chain.apply_update(local_chain::Update {

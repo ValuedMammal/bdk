@@ -149,6 +149,7 @@ fn main() -> anyhow::Result<()> {
                         None => rpc_args.lookahead.unwrap_or(DEFAULT_LOOKAHEAD),
                     };
                     request.add_descriptor(keychain, descriptor, target_index);
+                    request.include_mempool();
                 }
                 request.build_client(&rpc_client)
             };
@@ -157,7 +158,7 @@ fn main() -> anyhow::Result<()> {
             let Update {
                 tip,
                 indexed_tx_graph,
-            } = client.sync(/*include_mempool: */ true)?;
+            } = client.sync()?;
 
             {
                 // Apply updates

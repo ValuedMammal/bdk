@@ -1,7 +1,6 @@
 //! # Compact block filters
 //!
-//! This module provides a method of chain syncing via
-//! [`BIP157`](https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki)
+//! This module provides a method of chain syncing via [`BIP157`](https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki)
 //! compact block filters.
 //!
 //! # Example (TODO)
@@ -28,7 +27,7 @@ type Height = u32;
 /// Unix time
 type UnixTime = u64;
 
-/// A descriptor belonging to a keychain to be derived up to a target index.
+/// A keychain descriptor to be derived up to a target index.
 #[derive(Debug, Clone)]
 struct Watch<K> {
     keychain: K,
@@ -40,7 +39,8 @@ struct Watch<K> {
 #[derive(Debug)]
 pub struct Request<K> {
     watching: Vec<Watch<K>>,
-    last_cp: CheckPoint,
+    cp: CheckPoint,
+    include_mempool: bool,
 }
 
 impl<K: fmt::Debug + Clone + Ord> Request<K> {
@@ -48,7 +48,8 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
     pub fn new(last_cp: CheckPoint) -> Self {
         Self {
             watching: vec![],
-            last_cp,
+            cp: last_cp,
+            include_mempool: false,
         }
     }
 
@@ -64,6 +65,12 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
             descriptor,
             target_index,
         });
+        self
+    }
+
+    /// Whether to include relevant unconfirmed transactions in this request.
+    pub fn include_mempool(&mut self) -> &mut Self {
+        self.include_mempool = true;
         self
     }
 
@@ -84,7 +91,11 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
         Client {
             client,
             indexed_graph: IndexedTxGraph::new(indexer),
-            cp: self.last_cp,
+            request: Request {
+                watching: vec![],
+                cp: self.cp,
+                include_mempool: self.include_mempool,
+            },
         }
     }
 }
@@ -94,7 +105,7 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
 pub struct Client<'a, C, K> {
     client: &'a C,
     indexed_graph: IndexedTxGraph<ConfirmationTimeHeightAnchor, KeychainTxOutIndex<K>>,
-    cp: CheckPoint,
+    request: Request<K>,
 }
 
 impl<'a, C, K> Client<'a, C, K>
@@ -103,10 +114,7 @@ where
     K: fmt::Debug + Clone + Ord,
 {
     /// Sync to the new remote tip and return a new [`Update`].
-    ///
-    /// Set `include_mempool` to true to query the mempool for unconfirmed txs and include
-    /// them in the update.
-    pub fn sync(&mut self, include_mempool: bool) -> Result<Update<K>, Error> {
+    pub fn sync(&mut self) -> Result<Update<K>, Error> {
         // Create `Emitter` from the local tip `BlockId` and SPK inventory.
         let spks = self
             .indexed_graph
@@ -114,7 +122,7 @@ where
             .revealed_spks()
             .map(|(_k, _i, spk)| spk.to_owned());
 
-        let mut emitter = Emitter::new(self.client, self.cp.block_id(), spks);
+        let mut emitter = Emitter::new(self.client, self.request.cp.block_id(), spks);
 
         // Get new remote tip and consume events
         let mut blocks = vec![];
@@ -131,7 +139,6 @@ where
                     }
 
                     // Collect block ids
-                    // Note: can we use `CheckPoint::insert` here ?
                     Event::Id(inner) => blocks.push(inner.id),
 
                     // No match
@@ -141,7 +148,7 @@ where
         }
 
         // Query mempool for unconfirmed txs
-        if include_mempool {
+        if self.request.include_mempool {
             let unconfirmed = self.mempool()?;
             let _ = self.indexed_graph.batch_insert_relevant_unconfirmed(
                 unconfirmed.iter().map(|(tx, time)| (tx, *time)),
@@ -150,9 +157,9 @@ where
 
         // Construct update
         let tip = if !blocks.is_empty() {
-            chain_update_tip(self.cp.clone(), blocks)
+            chain_update_tip(self.request.cp.clone(), blocks)
         } else {
-            self.cp.clone()
+            self.request.cp.clone()
         };
         let indexed_tx_graph = core::mem::take(&mut self.indexed_graph);
 
@@ -323,7 +330,7 @@ where
     /// See [`super::Emitter::mempool`].
     fn mempool(&mut self) -> Result<Vec<(Transaction, UnixTime)>, Error> {
         // since this is a dummy Emitter, we can use a start height of 0.
-        let mut emitter = super::Emitter::new(self.client, self.cp.clone(), 0);
+        let mut emitter = super::Emitter::new(self.client, self.request.cp.clone(), 0);
         emitter.mempool().map_err(Error::Rpc)
     }
 }
@@ -339,7 +346,7 @@ fn chain_update_tip(cp: CheckPoint, block_ids: impl IntoIterator<Item = BlockId>
     let local_height = cp.height();
 
     let base = if local_height >= min_update_height {
-        // Find next lowest base to build on
+        // find next lowest base to build on
         cp.iter()
             .find(|cp| cp.height() < min_update_height)
             .expect("fallback to genesis")

@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     let compact_filter::Update {
         tip,
         indexed_tx_graph,
-    } = client.sync(/*include_mempool: */ false)?;
+    } = client.sync()?;
 
     // Apply updates
     let _ = chain.apply_update(local_chain::Update {
