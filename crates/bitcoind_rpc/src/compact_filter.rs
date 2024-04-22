@@ -268,9 +268,9 @@ where
             return Ok(None);
         }
 
-        // Force the starting height to be the minimum of (local_height + 1) and (tip_height - 9).
-        let min_update_height = tip_height.saturating_sub(9);
-        self.height = cmp::min(min_update_height, local_height + 1);
+        // Force the starting height to be the minimum of (tip_height - 9) and (local_height + 1).
+        let min_update_height = self.blocks.keys().next().expect("must have fetched blocks");
+        self.height = cmp::min(*min_update_height, local_height + 1);
         self.stop = tip_height;
 
         // Get the first filter
