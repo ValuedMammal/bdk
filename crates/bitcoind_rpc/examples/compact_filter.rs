@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     // Build request. note the type parameter `()` matches the
     // keychain kind of the receiver.
     let mut request = compact_filter::Request::<()>::new(chain.tip());
-    request.add_descriptor((), descriptor, 9);
+    request.add_descriptor((), descriptor, 0..10);
 
     let mut client = request.build_client(&rpc_client);
 

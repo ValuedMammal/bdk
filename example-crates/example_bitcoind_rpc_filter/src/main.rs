@@ -144,11 +144,11 @@ fn main() -> anyhow::Result<()> {
                 // Build request
                 let mut request = Request::<Keychain>::new(chain.tip());
                 for (keychain, descriptor) in graph.index.keychains().clone() {
-                    let target_index = match graph.index.last_revealed_index(&keychain) {
+                    let index = match graph.index.last_revealed_index(&keychain) {
                         Some(i) => i,
                         None => rpc_args.lookahead.unwrap_or(DEFAULT_LOOKAHEAD),
                     };
-                    request.add_descriptor(keychain, descriptor, target_index);
+                    request.add_descriptor(keychain, descriptor, 0..=index);
                     request.include_mempool();
                 }
                 request.build_client(&rpc_client)
@@ -184,11 +184,10 @@ fn main() -> anyhow::Result<()> {
     let cp = chain.tip();
     let graph = graph.lock().unwrap();
 
-    let indexed_outpoints = graph.index.outpoints();
     let balance = graph.graph().balance(
         &*chain,
         cp.block_id(),
-        indexed_outpoints.iter().cloned(),
+        graph.index.outpoints().clone(),
         |_, _| true,
     );
     println!("Local tip: {} : {}", cp.height(), cp.hash());

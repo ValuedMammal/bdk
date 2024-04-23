@@ -120,7 +120,7 @@ fn test_sync() -> Result<()> {
     // Sync
     let mut req = compact_filter::Request::<Keychain>::new(last_cp);
     let target_index = 9;
-    req.add_descriptor(keychain.clone(), descriptor, target_index);
+    req.add_descriptor(keychain.clone(), descriptor, 0..=target_index);
     let mut client = req.build_client(core);
     let compact_filter::Update {
         tip,

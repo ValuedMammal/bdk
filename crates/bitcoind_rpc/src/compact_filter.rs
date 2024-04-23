@@ -7,6 +7,8 @@
 
 use core::cmp;
 use core::fmt;
+use core::ops::Bound;
+use core::ops::RangeBounds;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -27,19 +29,20 @@ type Height = u32;
 /// Unix time
 type UnixTime = u64;
 
-/// A keychain descriptor to be derived up to a target index.
+/// A keychain descriptor derived over an index range.
 #[derive(Debug, Clone)]
 struct Watch<K> {
     keychain: K,
     descriptor: Descriptor<DescriptorPublicKey>,
-    target_index: u32,
+    range: (u32, u32),
 }
 
 /// A sync request.
 #[derive(Debug)]
 pub struct Request<K> {
-    watching: Vec<Watch<K>>,
     cp: CheckPoint,
+    watching: Vec<Watch<K>>,
+    spks: Vec<ScriptBuf>,
     include_mempool: bool,
 }
 
@@ -47,23 +50,34 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
     /// Create a new [`Request`] from the last local checkpoint.
     pub fn new(last_cp: CheckPoint) -> Self {
         Self {
-            watching: vec![],
             cp: last_cp,
+            watching: vec![],
+            spks: vec![],
             include_mempool: false,
         }
     }
 
-    /// Adds a descriptor to watch up to the specified `target_index`.
+    /// Add a descriptor to watch within an index `range`.
     pub fn add_descriptor(
         &mut self,
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
-        target_index: u32,
+        range: impl RangeBounds<u32>,
     ) -> &mut Self {
+        let start = match range.start_bound() {
+            Bound::Included(i) => *i,
+            Bound::Excluded(i) => *i + 1,
+            Bound::Unbounded => u32::MIN,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(i) => *i,
+            Bound::Excluded(i) => *i - 1,
+            Bound::Unbounded => u32::MAX,
+        };
         self.watching.push(Watch {
             keychain,
             descriptor,
-            target_index,
+            range: (start, end),
         });
         self
     }
@@ -78,22 +92,33 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
     pub fn build_client<C: bitcoincore_rpc::RpcApi>(self, client: &C) -> Client<C, K> {
         // index and reveal the requested SPKs
         let mut indexer = KeychainTxOutIndex::default();
+        let mut spks = vec![];
         for watch in self.watching {
             let Watch {
                 keychain,
                 descriptor,
-                target_index,
+                range,
             } = watch;
             indexer.add_keychain(keychain.clone(), descriptor);
-            let _ = indexer.reveal_to_target(&keychain, target_index);
+            let (start, end) = range;
+            let _ = indexer.reveal_to_target(&keychain, end);
+            for i in start..=end {
+                spks.push(
+                    indexer
+                        .spk_at_index(keychain.clone(), i)
+                        .expect("spk must be indexed")
+                        .to_owned(),
+                );
+            }
         }
 
         Client {
             client,
             indexed_graph: IndexedTxGraph::new(indexer),
             request: Request {
-                watching: vec![],
                 cp: self.cp,
+                watching: vec![],
+                spks,
                 include_mempool: self.include_mempool,
             },
         }
@@ -115,14 +140,14 @@ where
 {
     /// Sync to the new remote tip and return a new [`Update`].
     pub fn sync(&mut self) -> Result<Update<K>, Error> {
-        // Create `Emitter` from the local tip `BlockId` and SPK inventory.
-        let spks = self
-            .indexed_graph
-            .index
-            .revealed_spks()
-            .map(|(_k, _i, spk)| spk.to_owned());
+        let Request {
+            cp,
+            spks,
+            include_mempool,
+            ..
+        } = &self.request;
 
-        let mut emitter = Emitter::new(self.client, self.request.cp.block_id(), spks);
+        let mut emitter = Emitter::new(self.client, cp.block_id(), spks);
 
         // Get new remote tip and consume events
         let mut blocks = vec![];
@@ -148,8 +173,8 @@ where
         }
 
         // Query mempool for unconfirmed txs
-        if self.request.include_mempool {
-            let unconfirmed = self.mempool()?;
+        if *include_mempool {
+            let unconfirmed = mempool(self.client, cp.clone())?;
             let _ = self.indexed_graph.batch_insert_relevant_unconfirmed(
                 unconfirmed.iter().map(|(tx, time)| (tx, *time)),
             );
@@ -157,9 +182,9 @@ where
 
         // Construct update
         let tip = if !blocks.is_empty() {
-            chain_update_tip(self.request.cp.clone(), blocks)
+            chain_update_tip(cp.clone(), blocks)
         } else {
-            self.request.cp.clone()
+            cp.clone()
         };
         let indexed_tx_graph = core::mem::take(&mut self.indexed_graph);
 
@@ -178,7 +203,7 @@ struct Emitter<'a, C> {
     // local tip block id
     base: BlockId,
     // raw SPK inventory
-    spks: Vec<ScriptBuf>,
+    spks: &'a [ScriptBuf],
     // block map (height, hash)
     blocks: BTreeMap<Height, BlockHash>,
     // holds the next block filter
@@ -194,11 +219,11 @@ where
     C: bitcoincore_rpc::RpcApi,
 {
     /// Construct a new [`Emitter`].
-    fn new(client: &'a C, base: BlockId, spks: impl IntoIterator<Item = ScriptBuf>) -> Self {
+    fn new(client: &'a C, base: BlockId, spks: &'a [ScriptBuf]) -> Self {
         Self {
             client,
             base,
-            spks: spks.into_iter().collect(),
+            spks,
             blocks: BTreeMap::new(),
             next_filter: None,
             height: 0,
@@ -320,19 +345,17 @@ where
     }
 }
 
-impl<'a, C, K> Client<'a, C, K>
-where
-    C: bitcoincore_rpc::RpcApi,
-{
-    /// Emit mempool transactions, alongside their first-seen unix timestamps.
-    ///
-    /// This will internally call the corresponding method on [`Emitter`](crate::Emitter).
-    /// See [`super::Emitter::mempool`].
-    fn mempool(&mut self) -> Result<Vec<(Transaction, UnixTime)>, Error> {
-        // since this is a dummy Emitter, we can use a start height of 0.
-        let mut emitter = super::Emitter::new(self.client, self.request.cp.clone(), 0);
-        emitter.mempool().map_err(Error::Rpc)
-    }
+/// Emit mempool transactions, alongside their first-seen unix timestamps.
+///
+/// This will internally call the corresponding method on [`Emitter`](crate::Emitter).
+/// See [`super::Emitter::mempool`].
+fn mempool<C: bitcoincore_rpc::RpcApi>(
+    client: &C,
+    cp: CheckPoint,
+) -> Result<Vec<(Transaction, UnixTime)>, Error> {
+    // since this is a dummy Emitter, we can use a start height of 0.
+    let mut emitter = super::Emitter::new(client, cp, 0);
+    emitter.mempool().map_err(Error::Rpc)
 }
 
 /// Craft the new update tip
