@@ -80,7 +80,7 @@ const DESC: &str = "tr([7d94197e/86'/1'/0']tpubDCyQVJj8KzjiQsFjmb3KwECVXPvMwvAxx
 ///
 /// finally, expect computed balance equals send amt
 #[test]
-fn test_sync() -> Result<()> {
+fn sync_returns_chain_and_graph_update() -> Result<()> {
     let env = TestEnv::new()?;
     let core = env.client();
 

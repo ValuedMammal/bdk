@@ -38,12 +38,12 @@ struct Watch<K> {
 }
 
 /// A sync request.
-#[derive(Debug)]
 pub struct Request<K> {
     cp: CheckPoint,
     watching: Vec<Watch<K>>,
-    spks: Vec<ScriptBuf>,
     include_mempool: bool,
+    #[allow(clippy::type_complexity)]
+    inspect: Box<dyn Fn(&K, u32, &ScriptBuf)>,
 }
 
 impl<K: fmt::Debug + Clone + Ord> Request<K> {
@@ -52,8 +52,8 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
         Self {
             cp: last_cp,
             watching: vec![],
-            spks: vec![],
             include_mempool: false,
+            inspect: Box::new(|_, _, _| {}),
         }
     }
 
@@ -88,36 +88,47 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
         self
     }
 
+    /// Adds a callback to execute for each inspected spk.
+    pub fn inspect_spks<F>(&mut self, f: F)
+    where
+        F: Fn(&K, u32, &ScriptBuf) + 'static,
+    {
+        self.inspect = Box::new(f);
+    }
+
+    /// Inspect spk.
+    fn inspect_spk(&self, keychain: &K, index: u32, spk: &ScriptBuf) {
+        self.inspect.as_ref()(keychain, index, spk);
+    }
+
     /// Finish building the request and return a new [`Client`] with the given RPC `client`.
     pub fn build_client<C: bitcoincore_rpc::RpcApi>(self, client: &C) -> Client<C, K> {
         // index and reveal the requested SPKs
         let mut indexer = KeychainTxOutIndex::default();
         let mut spks = vec![];
-        for watch in self.watching {
+        let watching = self.watching.clone();
+        for watch in watching {
             let Watch {
                 keychain,
                 descriptor,
                 range,
             } = watch;
-            indexer.add_keychain(keychain.clone(), descriptor);
             let (start, end) = range;
-            let _ = indexer.reveal_to_target(&keychain, end);
-            for i in start..=end {
-                spks.push(
-                    indexer
-                        .spk_at_index(keychain.clone(), i)
-                        .expect("spk must be indexed")
-                        .to_owned(),
-                );
+            indexer.add_keychain(keychain.clone(), descriptor);
+            let (spk_iter, _) = indexer.reveal_to_target(&keychain, end);
+            for (spk_index, spk) in spk_iter {
+                if spk_index >= start {
+                    self.inspect_spk(&keychain, spk_index, &spk);
+                    spks.push(spk);
+                }
             }
         }
 
         Client {
             client,
             indexed_graph: IndexedTxGraph::new(indexer),
-            request: Request {
+            param: Params {
                 cp: self.cp,
-                watching: vec![],
                 spks,
                 include_mempool: self.include_mempool,
             },
@@ -125,12 +136,19 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
     }
 }
 
-/// Type for executing a compact filters [`sync`](Client::sync).
+/// Sync params.
 #[derive(Debug)]
+struct Params {
+    cp: CheckPoint,
+    spks: Vec<ScriptBuf>,
+    include_mempool: bool,
+}
+
+/// Type for executing a compact filters [`sync`](Client::sync).
 pub struct Client<'a, C, K> {
     client: &'a C,
     indexed_graph: IndexedTxGraph<ConfirmationTimeHeightAnchor, KeychainTxOutIndex<K>>,
-    request: Request<K>,
+    param: Params,
 }
 
 impl<'a, C, K> Client<'a, C, K>
@@ -140,12 +158,11 @@ where
 {
     /// Sync to the new remote tip and return a new [`Update`].
     pub fn sync(&mut self) -> Result<Update<K>, Error> {
-        let Request {
+        let Params {
             cp,
             spks,
             include_mempool,
-            ..
-        } = &self.request;
+        } = &self.param;
 
         let mut emitter = Emitter::new(self.client, cp.block_id(), spks);
 
@@ -167,7 +184,7 @@ where
                     Event::Id(inner) => blocks.push(inner.id),
 
                     // No match
-                    _ => continue,
+                    Event::NoMatch => continue,
                 }
             }
         }
@@ -181,10 +198,10 @@ where
         }
 
         // Construct update
-        let tip = if !blocks.is_empty() {
-            chain_update_tip(cp.clone(), blocks)
-        } else {
+        let tip = if blocks.is_empty() {
             cp.clone()
+        } else {
+            chain_update_tip(cp, blocks)
         };
         let indexed_tx_graph = core::mem::take(&mut self.indexed_graph);
 
@@ -359,7 +376,7 @@ fn mempool<C: bitcoincore_rpc::RpcApi>(
 }
 
 /// Craft the new update tip
-fn chain_update_tip(cp: CheckPoint, block_ids: impl IntoIterator<Item = BlockId>) -> CheckPoint {
+fn chain_update_tip(cp: &CheckPoint, block_ids: impl IntoIterator<Item = BlockId>) -> CheckPoint {
     let block_ids: BTreeSet<BlockId> = block_ids.into_iter().collect();
     let min_update_height = block_ids
         .iter()

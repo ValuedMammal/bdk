@@ -1,13 +1,13 @@
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time;
+use std::{io::Write, path::PathBuf};
 
 use bdk_bitcoind_rpc::{
     bitcoincore_rpc::{Auth, Client, RpcApi},
     compact_filter::{Request, Update},
 };
 use bdk_chain::{
-    bitcoin::{constants::genesis_block, hashes::Hash, BlockHash},
+    bitcoin::{constants::genesis_block, hashes::Hash, Address, BlockHash, Network},
     BlockId,
 };
 use bdk_chain::{
@@ -149,6 +149,15 @@ fn main() -> anyhow::Result<()> {
                         None => rpc_args.lookahead.unwrap_or(DEFAULT_LOOKAHEAD),
                     };
                     request.add_descriptor(keychain, descriptor, 0..=index);
+                    request.inspect_spks(|keychain, spk_index, spk| {
+                        println!(
+                            "Scanning {} address at index {:<3}: {}",
+                            keychain,
+                            spk_index,
+                            Address::from_script(spk, Network::Signet).unwrap()
+                        );
+                        std::io::stdout().flush().unwrap();
+                    });
                     request.include_mempool();
                 }
                 request.build_client(&rpc_client)
