@@ -48,8 +48,6 @@ struct Watch<K> {
 pub struct Request<K> {
     cp: CheckPoint,
     watching: Vec<Watch<K>>,
-    #[allow(clippy::type_complexity)]
-    inspect: Box<dyn Fn(u32, &ScriptBuf)>,
 }
 
 impl<K> Request<K> {
@@ -58,7 +56,6 @@ impl<K> Request<K> {
         Self {
             cp: last_cp,
             watching: vec![],
-            inspect: Box::new(|_, _| {}),
         }
     }
 }
@@ -91,19 +88,6 @@ where
         });
     }
 
-    /// Adds a callback to be called on each inspected spk.
-    pub fn inspect_spks<F>(&mut self, f: F)
-    where
-        F: Fn(u32, &ScriptBuf) + 'static,
-    {
-        self.inspect = Box::new(f);
-    }
-
-    /// Inspect spk
-    fn inspect_spk(&self, index: u32, spk: &ScriptBuf) {
-        self.inspect.as_ref()(index, spk);
-    }
-
     /// Into client handle.
     pub fn into_client_handle<H: Handle>(self, handle: H) -> ClientHandle<H, K> {
         // derive spks
@@ -121,26 +105,24 @@ where
             let (spk_iter, _) = indexer.reveal_to_target(&keychain, end);
             for (spk_index, spk) in spk_iter {
                 if spk_index >= start {
-                    self.inspect_spk(spk_index, &spk);
                     spks.push(spk);
                 }
             }
         }
 
         let mut handle = ClientHandle::new(handle, self.cp);
+        handle.spks = Box::new(spks.into_iter());
         handle.graph = IndexedTxGraph::new(indexer);
-        handle.spks = spks;
         handle
     }
 }
 
 /// Type for managing block filters sync.
-#[derive(Debug)]
 pub struct ClientHandle<H, K> {
     // client handle
     handle: H,
     // script pubkeys to watch
-    spks: Vec<ScriptBuf>,
+    spks: Box<dyn Iterator<Item = ScriptBuf>>,
     // block map
     blocks: BTreeMap<Height, BlockHash>,
     // indexed graph
@@ -161,7 +143,7 @@ impl<H: Handle, K> ClientHandle<H, K> {
     pub fn new(handle: H, cp: CheckPoint) -> Self {
         Self {
             handle,
-            spks: Vec::new(),
+            spks: Box::new(core::iter::empty()),
             blocks: BTreeMap::new(),
             cp,
             height: 0,
@@ -186,9 +168,13 @@ impl<H: Handle, K> ClientHandle<H, K> {
         &self.handle
     }
 
-    /// Returns the count of the current scan inventory.
-    pub fn inventory_len(&self) -> usize {
-        self.spks.len()
+    /// Adds a closure to be called for each inspected spk.
+    pub fn inspect_spks<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&ScriptBuf) + 'static,
+    {
+        self.spks = Box::new(self.spks.inspect(move |spk| f(spk)));
+        self
     }
 
     /// Waits for `count` peer connections and returns the best height of connected peers.
@@ -223,10 +209,12 @@ where
 
         // wait for client to reach peer_height before getting the tip
         let peer_height = self.wait_for_peers(1)?;
-        let _ = self
-            .handle
-            .wait_for_height(peer_height as u64)
-            .map_err(Error::Handle)?;
+        if self.cp.height() < peer_height {
+            let _ = self
+                .handle
+                .wait_for_height(peer_height as u64)
+                .map_err(Error::Handle)?;
+        }
 
         let (height, mut header, _work) = self.handle.get_tip().map_err(Error::Handle)?;
         let tip_height = height as u32;
@@ -272,7 +260,7 @@ where
         // initiate rescan
         let watch = self
             .spks
-            .iter()
+            .as_mut()
             .map(|s| Script::from_hex(&s.to_hex_string()).expect("parse Script"));
         let _ = self
             .handle
@@ -280,7 +268,7 @@ where
             .map_err(Error::Handle);
 
         // process events
-        let _ = self._rescan();
+        let _ = self.handle_events();
 
         // create update
         self.as_update()
@@ -292,12 +280,12 @@ where
         chain_synced && (self.filters_matched == 0 || self.blocks_matched == self.filters_matched)
     }
 
-    /// Rescan internal fn
+    /// Handle events.
     ///
-    /// On each block event, apply Block to the graph if it matches our watch list, inserting
+    /// On each block event, apply Block to the graph if it matches our watch list,
     /// inserting (height, hash) checkpoints into the blocks map along the way. We also
     /// need to increment the last height seen to know when to stop.
-    fn _rescan(&mut self) -> Result<(), Error> {
+    fn handle_events(&mut self) -> Result<(), Error> {
         let recv = self.handle.events();
 
         loop {

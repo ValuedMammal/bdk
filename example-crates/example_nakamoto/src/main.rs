@@ -136,18 +136,11 @@ fn main() -> Result<()> {
         for (keychain, descriptor) in graph.index.keychains().clone() {
             request.add_descriptor(&keychain, descriptor, 0..10);
         }
-        request.inspect_spks(|i, spk| {
-            log::info!(
-                "Address at index {}: {}",
-                i,
-                bitcoin::Address::from_script(spk, bitcoin::Network::Signet).unwrap()
-            );
-        });
 
         let client = client();
         let handle = client.handle();
         let handle: ClientHandle<_, _> = request.into_client_handle(handle);
-        log::info!("Collected spk inventory size: {}", handle.inventory_len());
+        //log::info!("Collected spk inventory size: {}", handle.inventory_len());
 
         (handle, client)
     };
@@ -160,6 +153,12 @@ fn main() -> Result<()> {
     // Allow client to catch up with network
     let (tip_height, tip_hash) = handle.get_tip()?;
     log::info!("Connecting to peers at height {tip_height} : {tip_hash}");
+
+    // Inspect spks
+    let mut handle = handle.inspect_spks(|spk| {
+        let addr = bitcoin::Address::from_script(spk, bitcoin::Network::Signet).unwrap();
+        log::info!("Watching Address: {addr}");
+    });
 
     match cmd {
         // sync the client only
