@@ -12,7 +12,6 @@ use std::str::FromStr;
 
 use bdk_chain::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_chain::keychain::KeychainTxOutIndex;
-use bdk_chain::local_chain;
 use bdk_chain::local_chain::CheckPoint;
 use bdk_chain::BlockId;
 use bdk_chain::ConfirmationTimeHeightAnchor;
@@ -215,7 +214,7 @@ where
         let watch = self
             .spks
             .as_mut()
-            // note: this string conversion is to workaround the dependency mismatch
+            // note: this is a workaround due to dependency mismatch
             .map(|(_, _, s)| Script::from_hex(&s.to_hex_string()).expect("parse Script"));
         let _ = self
             .handle
@@ -314,11 +313,7 @@ where
             self.blocks()
                 .map(|(&height, &hash)| BlockId { height, hash }),
         );
-        let tip = CheckPoint::from_block_ids(blocks).expect("blocks are well ordered");
-        let chain_update = local_chain::Update {
-            tip,
-            introduce_older_blocks: true,
-        };
+        let chain_update = CheckPoint::from_block_ids(blocks).expect("blocks are well ordered");
 
         let indexed_graph = core::mem::take(&mut self.graph);
 
@@ -357,7 +352,7 @@ impl<H: Handle, K> ClientHandle<H, K> {
 #[derive(Debug)]
 pub struct Update<K> {
     /// Local chain update
-    pub chain_update: local_chain::Update,
+    pub chain_update: CheckPoint,
     /// Indexed tx-graph
     pub indexed_graph: IndexedTxGraph<ConfirmationTimeHeightAnchor, KeychainTxOutIndex<K>>,
 }
