@@ -430,6 +430,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/* FIXME: make bdk and nakamoto depend on the same version of rust-bitcoin, and these won't be necessary */
 /// Maps a nakamoto `&BlockHash` to a bdk `Blockhash`.
 fn nakamoto_str_hash(hash: &nakamoto::common::bitcoin::BlockHash) -> bdk_chain::bitcoin::BlockHash {
     bdk_chain::bitcoin::BlockHash::from_str(&hash.to_string()).expect("parse BlockHash")
