@@ -72,6 +72,7 @@ fn client() -> Client<Reactor<TcpStream>> {
 
 fn main() -> Result<()> {
     pretty_env_logger::init();
+    let start = std::time::Instant::now();
 
     let example_cli::Init {
         args,
@@ -148,9 +149,9 @@ fn main() -> Result<()> {
     log::info!("Connecting to peers at height {tip_height} : {tip_hash}");
 
     // Inspect spks
-    let mut handle = handle.inspect_spks(|idx, spk| {
-        let addr = bitcoin::Address::from_script(spk, bitcoin::Network::Signet).unwrap();
-        log::info!("Watching Address at index {idx}: {addr}");
+    handle = handle.inspect_spks(move |k, idx, spk| {
+        let addr = bitcoin::Address::from_script(spk, args.network).unwrap();
+        log::info!("Watching {k:?} address at index {idx:<3} {addr}");
     });
 
     match cmd {
@@ -185,6 +186,7 @@ fn main() -> Result<()> {
 
     let cp = chain.lock().unwrap().tip();
     log::info!("Synced to height {}", cp.height());
+    log::info!("Elapsed time {}s", start.elapsed().as_secs_f32());
     log::info!("Shutting down");
     handle.shutdown();
 

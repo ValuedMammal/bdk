@@ -48,7 +48,7 @@ impl<'a, K> Request<'a, K> {
 
 impl<'a, K> Request<'a, K>
 where
-    K: fmt::Debug + Clone + Ord,
+    K: fmt::Debug + Clone + Ord + 'static,
 {
     /// Into client handle.
     pub fn into_client_handle<H: Handle>(self, handle: H) -> ClientHandle<H, K> {
@@ -56,12 +56,15 @@ where
         let mut indexer = KeychainTxOutIndex::default();
 
         // reveal spks
-        let mut spks: Box<dyn Iterator<Item = (u32, ScriptBuf)>> = Box::new(core::iter::empty());
+        let mut spks: Box<dyn Iterator<Item = (K, u32, ScriptBuf)>> = Box::new(core::iter::empty());
         for (keychain, desc) in self.indexer.keychains().clone() {
             indexer.add_keychain(keychain.clone(), desc);
-            let reveal_to = self.indexer.last_revealed_index(&keychain).unwrap_or(20);
+
+            let reveal_to = self.indexer.last_revealed_index(&keychain).unwrap_or(10);
             let (spk_iter, _) = indexer.reveal_to_target(&keychain, reveal_to);
-            spks = Box::new(spks.chain(spk_iter.into_iter()));
+            for (idx, spk) in spk_iter {
+                spks = Box::new(spks.chain(core::iter::once((keychain.clone(), idx, spk))));
+            }
         }
 
         let mut handle = ClientHandle::new(handle, self.cp);
@@ -76,7 +79,7 @@ pub struct ClientHandle<H, K> {
     // client handle
     handle: H,
     // match inventory
-    spks: Box<dyn Iterator<Item = (u32, ScriptBuf)>>,
+    spks: Box<dyn Iterator<Item = (K, u32, ScriptBuf)>>,
     // block map
     blocks: BTreeMap<Height, BlockHash>,
     // indexed graph
@@ -94,7 +97,7 @@ pub struct ClientHandle<H, K> {
 
 impl<H: Handle, K> ClientHandle<H, K>
 where
-    K: fmt::Debug + Clone + Ord,
+    K: fmt::Debug + Clone + Ord + 'static,
 {
     /// Construct a new [`ClientHandle`].
     pub fn new(handle: H, cp: CheckPoint) -> Self {
@@ -128,9 +131,9 @@ where
     /// Adds a closure to be called for every watched spk.
     pub fn inspect_spks<F>(mut self, f: F) -> Self
     where
-        F: Fn(&u32, &ScriptBuf) + 'static,
+        F: Fn(&K, u32, &ScriptBuf) + 'static,
     {
-        self.spks = Box::new(self.spks.inspect(move |(idx, spk)| f(idx, spk)));
+        self.spks = Box::new(self.spks.inspect(move |(k, idx, spk)| f(k, *idx, spk)));
         self
     }
 
@@ -156,7 +159,7 @@ where
 impl<H, K> ClientHandle<H, K>
 where
     H: Handle,
-    K: fmt::Debug + Clone + Ord,
+    K: fmt::Debug + Clone + Ord + 'static,
 {
     /// Get the new remote tip.
     ///
@@ -165,13 +168,7 @@ where
         self.blocks.clear();
 
         // wait for client to reach peer_height before getting the tip
-        let peer_height = self.wait_for_peers(1)?;
-        if self.cp.height() < peer_height {
-            let _ = self
-                .handle
-                .wait_for_height(peer_height as u64)
-                .map_err(Error::Handle)?;
-        }
+        let _ = self.wait_for_peers(2)?;
 
         let (height, mut header, _work) = self.handle.get_tip().map_err(Error::Handle)?;
         let tip_height = height as u32;
@@ -219,7 +216,7 @@ where
             .spks
             .as_mut()
             // note: this string conversion is to workaround the dependency mismatch
-            .map(|(_, s)| Script::from_hex(&s.to_hex_string()).expect("parse Script"));
+            .map(|(_, _, s)| Script::from_hex(&s.to_hex_string()).expect("parse Script"));
         let _ = self
             .handle
             .rescan(start..=end, watch)
