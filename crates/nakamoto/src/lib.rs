@@ -14,8 +14,6 @@ use bdk_chain::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_chain::keychain::KeychainTxOutIndex;
 use bdk_chain::local_chain;
 use bdk_chain::local_chain::CheckPoint;
-use bdk_chain::miniscript::Descriptor;
-use bdk_chain::miniscript::DescriptorPublicKey;
 use bdk_chain::BlockId;
 use bdk_chain::ConfirmationTimeHeightAnchor;
 use bdk_chain::IndexedTxGraph;
@@ -32,86 +30,42 @@ pub use nakamoto::net::poll as net_poll;
 /// Block height.
 type Height = u32;
 
-/// Type for watching a ranged descriptor.
-#[allow(unused)]
-#[derive(Debug, Clone)]
-struct Watch<K> {
-    /// Keychain
-    keychain: K,
-    /// Descriptor
-    descriptor: Descriptor<DescriptorPublicKey>,
-    /// Range
-    range: (u32, u32),
-}
-
 /// Request.
-pub struct Request<K> {
+pub struct Request<'a, K> {
     cp: CheckPoint,
-    watching: Vec<Watch<K>>,
+    indexer: &'a KeychainTxOutIndex<K>,
 }
 
-impl<K> Request<K> {
+impl<'a, K> Request<'a, K> {
     /// New.
-    pub fn new(last_cp: CheckPoint) -> Self {
+    pub fn new(last_cp: CheckPoint, indexer: &'a KeychainTxOutIndex<K>) -> Self {
         Self {
             cp: last_cp,
-            watching: vec![],
+            indexer,
         }
     }
 }
 
-impl<K> Request<K>
+impl<'a, K> Request<'a, K>
 where
     K: fmt::Debug + Clone + Ord,
 {
-    /// Add descriptor.
-    pub fn add_descriptor(
-        &mut self,
-        keychain: &K,
-        descriptor: Descriptor<DescriptorPublicKey>,
-        range: impl RangeBounds<u32>,
-    ) {
-        let start = match range.start_bound() {
-            std::ops::Bound::Included(i) => *i,
-            std::ops::Bound::Excluded(i) => *i + 1,
-            std::ops::Bound::Unbounded => u32::MIN,
-        };
-        let end = match range.end_bound() {
-            std::ops::Bound::Included(i) => *i,
-            std::ops::Bound::Excluded(i) => *i - 1,
-            std::ops::Bound::Unbounded => u32::MAX,
-        };
-        self.watching.push(Watch {
-            keychain: keychain.clone(),
-            descriptor,
-            range: (start, end),
-        });
-    }
-
     /// Into client handle.
     pub fn into_client_handle<H: Handle>(self, handle: H) -> ClientHandle<H, K> {
-        // derive spks
+        // initialize new indexer
         let mut indexer = KeychainTxOutIndex::default();
-        let mut spks = vec![];
-        let watching = self.watching.clone();
-        for watch in watching {
-            let Watch {
-                keychain,
-                descriptor,
-                range,
-            } = watch;
-            let (start, end) = range;
-            indexer.add_keychain(keychain.clone(), descriptor);
-            let (spk_iter, _) = indexer.reveal_to_target(&keychain, end);
-            for (spk_index, spk) in spk_iter {
-                if spk_index >= start {
-                    spks.push(spk);
-                }
-            }
+
+        // reveal spks
+        let mut spks: Box<dyn Iterator<Item = (u32, ScriptBuf)>> = Box::new(core::iter::empty());
+        for (keychain, desc) in self.indexer.keychains().clone() {
+            indexer.add_keychain(keychain.clone(), desc);
+            let reveal_to = self.indexer.last_revealed_index(&keychain).unwrap_or(20);
+            let (spk_iter, _) = indexer.reveal_to_target(&keychain, reveal_to);
+            spks = Box::new(spks.chain(spk_iter.into_iter()));
         }
 
         let mut handle = ClientHandle::new(handle, self.cp);
-        handle.spks = Box::new(spks.into_iter());
+        handle.spks = spks;
         handle.graph = IndexedTxGraph::new(indexer);
         handle
     }
@@ -121,8 +75,8 @@ where
 pub struct ClientHandle<H, K> {
     // client handle
     handle: H,
-    // script pubkeys to watch
-    spks: Box<dyn Iterator<Item = ScriptBuf>>,
+    // match inventory
+    spks: Box<dyn Iterator<Item = (u32, ScriptBuf)>>,
     // block map
     blocks: BTreeMap<Height, BlockHash>,
     // indexed graph
@@ -138,7 +92,10 @@ pub struct ClientHandle<H, K> {
     blocks_matched: usize,
 }
 
-impl<H: Handle, K> ClientHandle<H, K> {
+impl<H: Handle, K> ClientHandle<H, K>
+where
+    K: fmt::Debug + Clone + Ord,
+{
     /// Construct a new [`ClientHandle`].
     pub fn new(handle: H, cp: CheckPoint) -> Self {
         Self {
@@ -168,12 +125,12 @@ impl<H: Handle, K> ClientHandle<H, K> {
         &self.handle
     }
 
-    /// Adds a closure to be called for each inspected spk.
+    /// Adds a closure to be called for every watched spk.
     pub fn inspect_spks<F>(mut self, f: F) -> Self
     where
-        F: Fn(&ScriptBuf) + 'static,
+        F: Fn(&u32, &ScriptBuf) + 'static,
     {
-        self.spks = Box::new(self.spks.inspect(move |spk| f(spk)));
+        self.spks = Box::new(self.spks.inspect(move |(idx, spk)| f(idx, spk)));
         self
     }
 
@@ -261,7 +218,8 @@ where
         let watch = self
             .spks
             .as_mut()
-            .map(|s| Script::from_hex(&s.to_hex_string()).expect("parse Script"));
+            // note: this string conversion is to workaround the dependency mismatch
+            .map(|(_, s)| Script::from_hex(&s.to_hex_string()).expect("parse Script"));
         let _ = self
             .handle
             .rescan(start..=end, watch)
