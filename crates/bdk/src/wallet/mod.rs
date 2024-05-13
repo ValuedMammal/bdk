@@ -43,6 +43,7 @@ use bitcoin::{constants::genesis_block, Amount};
 use core::fmt;
 use core::ops::Deref;
 use descriptor::error::Error as DescriptorError;
+use miniscript::descriptor::{DescriptorPublicKey, DescriptorSecretKey, DescriptorType};
 use miniscript::psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier};
 
 use bdk_chain::tx_graph::CalculateFeeError;
@@ -627,6 +628,58 @@ impl Wallet {
             network,
             genesis_hash,
         )
+    }
+
+    /// Create a [`Wallet`] from a [BIP389](https://github.com/bitcoin/bips/blob/master/bip-0389.mediawiki)
+    /// multipath descriptor `&str` and `descriptor_type`.
+    pub fn new_or_load_multipath(
+        descriptor: &str,
+        descriptor_type: DescriptorType,
+        db: impl PersistBackend<ChangeSet> + Send + Sync + 'static,
+        network: Network,
+    ) -> Result<Self, String> {
+        use core::str::FromStr;
+
+        let wrapper = match descriptor_type {
+            DescriptorType::Wpkh => "wpkh",
+            DescriptorType::Tr => "tr",
+            _ => return Err("unsupported descriptor type".into()),
+        };
+
+        // Parse multipath descriptor into two descriptor strings.
+        let (descriptor, change_descriptor) = match DescriptorSecretKey::from_str(descriptor) {
+            Ok(desc_sk) => {
+                if !desc_sk.is_multipath() {
+                    return Err("not a multipath descriptor".into());
+                }
+                let xkeys: Vec<DescriptorSecretKey> = desc_sk.into_single_keys();
+                let descriptor = format!("{}({})", wrapper, xkeys[0]);
+                let change_descriptor = format!("{}({})", wrapper, xkeys[1]);
+                (descriptor, change_descriptor)
+            }
+            Err(_) => {
+                let desc_pk = DescriptorPublicKey::from_str(descriptor)
+                    .map_err(|_| "failed to parse descriptor".to_string())?;
+
+                if !desc_pk.is_multipath() {
+                    return Err("not a multipath descriptor".into());
+                }
+                let xkeys: Vec<DescriptorPublicKey> = desc_pk.into_single_keys();
+                let descriptor = format!("{}({})", wrapper, xkeys[0]);
+                let change_descriptor = format!("{}({})", wrapper, xkeys[1]);
+                (descriptor, change_descriptor)
+            }
+        };
+
+        let genesis_hash = genesis_block(network).block_hash();
+        Self::new_or_load_with_genesis_hash(
+            &descriptor,
+            Some(&change_descriptor),
+            db,
+            network,
+            genesis_hash,
+        )
+        .map_err(|e| format!("failed to create Wallet: {}", e))
     }
 
     /// Either loads [`Wallet`] from persistence, or initializes it if it does not exist, using the

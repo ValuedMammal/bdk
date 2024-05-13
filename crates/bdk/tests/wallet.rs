@@ -69,6 +69,37 @@ const P2WPKH_FAKE_WITNESS_SIZE: usize = 106;
 const DB_MAGIC: &[u8] = &[0x21, 0x24, 0x48];
 
 #[test]
+fn new_or_load_multipath() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let file_path = temp_dir.path().join("store.db");
+
+    {
+        let db = bdk_file_store::Store::open_or_create_new(DB_MAGIC, &file_path).unwrap();
+        let desc = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/<0;1>/*";
+        let desc_ty = miniscript::descriptor::DescriptorType::Wpkh;
+        let wallet = Wallet::new_or_load_multipath(desc, desc_ty, db, Network::Testnet).unwrap();
+        // wallet has two descriptors with private keys present
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            assert!(wallet.public_descriptor(keychain.clone()).is_some());
+            let keymap = wallet.get_signers(keychain).as_key_map(wallet.secp_ctx());
+            assert!(!keymap.is_empty());
+        }
+    }
+    {
+        let db = bdk_file_store::Store::open_or_create_new(DB_MAGIC, &file_path).unwrap();
+        let desc = "[e273fe42/84'/1'/0']tpubDCmr3Luq75npLaYmRqqW1rLfSbfpnBXwLwAmUbR333fp95wjCHar3zoc9zSWovZFwrWr53mm3NTVqt6d1Pt6G26uf4etQjc3Pr5Hxe9QEQ2/<0;1>/*";
+        let desc_ty = miniscript::descriptor::DescriptorType::Wpkh;
+        let wallet = Wallet::new_or_load_multipath(desc, desc_ty, db, Network::Testnet).unwrap();
+        // public descriptors only
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            assert!(wallet.public_descriptor(keychain.clone()).is_some());
+            let keymap = wallet.get_signers(keychain).as_key_map(wallet.secp_ctx());
+            assert!(keymap.is_empty());
+        }
+    }
+}
+
+#[test]
 fn load_recovers_wallet() {
     let temp_dir = tempfile::tempdir().expect("must create tempdir");
     let file_path = temp_dir.path().join("store.db");
