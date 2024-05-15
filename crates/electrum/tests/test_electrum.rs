@@ -24,7 +24,7 @@ fn get_balance(
 ///
 /// 1. Mine 101 blocks.
 /// 2. Send a tx.
-/// 3. Mine extra block to confirm sent tx.
+/// 3. Check update contains outputs of previous tx
 /// 4. Check [`Balance`] to ensure tx is confirmed.
 #[test]
 fn scan_detects_confirmed_tx() -> anyhow::Result<()> {
@@ -53,11 +53,45 @@ fn scan_detects_confirmed_tx() -> anyhow::Result<()> {
     // Mine some blocks.
     env.mine_blocks(101, Some(addr_to_mine))?;
 
+    // Send a preliminary tx such that the new utxo in Core's wallet
+    // becomes the input of the next tx
+    let new_addr = env
+        .rpc_client()
+        .get_new_address(None, None)?
+        .assume_checked();
+    let prev_amt = SEND_AMOUNT + Amount::from_sat(1650);
+    env.send(&new_addr, prev_amt)?;
+    env.mine_blocks(1, None)?;
+
     // Create transaction that is tracked by our receiver.
-    env.send(&addr_to_track, SEND_AMOUNT)?;
+    let txid = env.send(&addr_to_track, SEND_AMOUNT)?;
 
     // Mine a block to confirm sent tx.
     env.mine_blocks(1, None)?;
+
+    // Look at the tx we just sent, it should have 1 input and 1 output
+    let tx = env.rpc_client().get_raw_transaction_info(&txid, None)?;
+    assert_eq!(tx.vin.len(), 1);
+    assert_eq!(tx.vout.len(), 1);
+    let vin = &tx.vin[0];
+    let prev_txid = vin.txid.unwrap();
+    let vout = vin.vout.unwrap();
+    let outpoint = bdk_chain::bitcoin::OutPoint::new(prev_txid, vout);
+
+    // Get the txout of the previous tx
+    let prev_tx = env
+        .rpc_client()
+        .get_raw_transaction_info(&prev_txid, None)?;
+    let txout = prev_tx
+        .vout
+        .iter()
+        .find(|txout| txout.value == prev_amt)
+        .unwrap();
+    let script_pubkey = ScriptBuf::from_bytes(txout.script_pub_key.hex.to_vec());
+    let txout = bdk_chain::bitcoin::TxOut {
+        value: txout.value,
+        script_pubkey,
+    };
 
     // Sync up to tip.
     env.wait_until_electrum_sees_block()?;
@@ -73,6 +107,15 @@ fn scan_detects_confirmed_tx() -> anyhow::Result<()> {
     let _ = recv_chain
         .apply_update(update.chain_update)
         .map_err(|err| anyhow::anyhow!("LocalChain update error: {:?}", err))?;
+
+    // Check the graph update contains the right floating txout
+    let graph_txout = update
+        .graph_update
+        .all_txouts()
+        .find(|(_op, txout)| txout.value == prev_amt)
+        .unwrap();
+    assert_eq!(graph_txout, (outpoint, &txout));
+
     let _ = recv_graph.apply_update(update.graph_update);
 
     // Check to see if tx is confirmed.
@@ -104,7 +147,7 @@ fn scan_detects_confirmed_tx() -> anyhow::Result<()> {
             .to_sat() as u64;
 
         // Check that the calculated fee matches the fee from the transaction data.
-        assert_eq!(fee, tx_fee);
+        assert_eq!(fee, tx_fee); // 1650sat
     }
 
     Ok(())
