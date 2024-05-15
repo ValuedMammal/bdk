@@ -36,10 +36,9 @@ impl TestEnv {
                     .expect(
                 "you need to provide an env var BITCOIND_EXE or specify a bitcoind version feature",
                 );
-                electrsd::bitcoind::BitcoinD::with_conf(
-                    bitcoind_exe,
-                    &electrsd::bitcoind::Conf::default(),
-                )
+                let mut conf = electrsd::bitcoind::Conf::default();
+                conf.args.push("-txindex=1");
+                electrsd::bitcoind::BitcoinD::with_conf(bitcoind_exe, &conf)
             }
         }?;
 
