@@ -641,7 +641,9 @@ impl Wallet {
         use core::str::FromStr;
 
         let wrapper = match descriptor_type {
+            DescriptorType::Pkh => "pkh",
             DescriptorType::Wpkh => "wpkh",
+            DescriptorType::Wsh => "wsh",
             DescriptorType::Tr => "tr",
             _ => return Err(NewOrLoadError::Descriptor(DescriptorError::DescriptorType)),
         };
