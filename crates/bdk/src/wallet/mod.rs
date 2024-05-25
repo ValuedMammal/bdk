@@ -637,20 +637,22 @@ impl Wallet {
         descriptor_type: DescriptorType,
         db: impl PersistBackend<ChangeSet> + Send + Sync + 'static,
         network: Network,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NewOrLoadError> {
         use core::str::FromStr;
 
         let wrapper = match descriptor_type {
             DescriptorType::Wpkh => "wpkh",
             DescriptorType::Tr => "tr",
-            _ => return Err("unsupported descriptor type".into()),
+            _ => return Err(NewOrLoadError::Descriptor(DescriptorError::DescriptorType)),
         };
 
         // Parse multipath descriptor into two descriptor strings.
         let (descriptor, change_descriptor) = match DescriptorSecretKey::from_str(descriptor) {
             Ok(desc_sk) => {
                 if !desc_sk.is_multipath() {
-                    return Err("not a multipath descriptor".into());
+                    return Err(NewOrLoadError::Descriptor(
+                        DescriptorError::NotAMultiPathDescriptor,
+                    ));
                 }
                 let xkeys: Vec<DescriptorSecretKey> = desc_sk.into_single_keys();
                 let descriptor = format!("{}({})", wrapper, xkeys[0]);
@@ -659,10 +661,12 @@ impl Wallet {
             }
             Err(_) => {
                 let desc_pk = DescriptorPublicKey::from_str(descriptor)
-                    .map_err(|_| "failed to parse descriptor".to_string())?;
+                    .map_err(|_| NewOrLoadError::Descriptor(DescriptorError::ParseDescriptor))?;
 
                 if !desc_pk.is_multipath() {
-                    return Err("not a multipath descriptor".into());
+                    return Err(NewOrLoadError::Descriptor(
+                        DescriptorError::NotAMultiPathDescriptor,
+                    ));
                 }
                 let xkeys: Vec<DescriptorPublicKey> = desc_pk.into_single_keys();
                 let descriptor = format!("{}({})", wrapper, xkeys[0]);
@@ -679,7 +683,6 @@ impl Wallet {
             network,
             genesis_hash,
         )
-        .map_err(|e| format!("failed to create Wallet: {}", e))
     }
 
     /// Either loads [`Wallet`] from persistence, or initializes it if it does not exist, using the

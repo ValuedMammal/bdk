@@ -23,15 +23,18 @@ pub enum Error {
     HardenedDerivationXpub,
     /// The descriptor contains multipath keys
     MultiPath,
-
+    /// The descriptor is not a BIP389 multipath descriptor
+    NotAMultiPathDescriptor,
+    /// Error parsing a descriptor from str
+    ParseDescriptor,
+    /// Unsupported [`DescriptorType`](miniscript::descriptor::DescriptorType)
+    DescriptorType,
     /// Error thrown while working with [`keys`](crate::keys)
     Key(crate::keys::KeyError),
     /// Error while extracting and manipulating policies
     Policy(crate::descriptor::policy::PolicyError),
-
     /// Invalid byte found in the descriptor checksum
     InvalidDescriptorCharacter(u8),
-
     /// BIP32 error
     Bip32(bitcoin::bip32::Error),
     /// Error during base58 decoding
@@ -69,6 +72,9 @@ impl fmt::Display for Error {
                 f,
                 "The descriptor contains multipath keys, which are not supported yet"
             ),
+            Self::NotAMultiPathDescriptor => write!(f, "not a multipath descriptor"),
+            Self::ParseDescriptor => write!(f, "failed to parse descriptor"),
+            Self::DescriptorType => write!(f, "unsupported descriptor type"),
             Self::Key(err) => write!(f, "Key error: {}", err),
             Self::Policy(err) => write!(f, "Policy error: {}", err),
             Self::InvalidDescriptorCharacter(char) => {
