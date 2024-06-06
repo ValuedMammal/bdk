@@ -62,3 +62,8 @@ required-features = ["all-keys"]
 name = "miniscriptc"
 path = "examples/compiler.rs"
 required-features = ["compiler"]
+
+[[example]]
+name = "tx_chain"
+path = "examples/tx_chain.rs"
+required-features = []
