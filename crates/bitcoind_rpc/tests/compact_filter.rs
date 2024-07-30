@@ -3,6 +3,7 @@ use bdk_chain::indexer::keychain_txout::KeychainTxOutIndex;
 use bdk_chain::local_chain::LocalChain;
 use bdk_chain::miniscript::Descriptor;
 use bdk_chain::ConfirmationBlockTime;
+use bdk_chain::DescriptorExt;
 use bdk_chain::IndexedTxGraph;
 use bdk_testenv::anyhow::Result;
 use bdk_testenv::bitcoind;
@@ -86,6 +87,7 @@ fn sync_returns_chain_and_graph_update() -> Result<()> {
     // Setup receiving chain and graph structures.
     let secp = Secp256k1::new();
     let (descriptor, _) = Descriptor::parse_descriptor(&secp, DESC)?;
+    let desc_id = descriptor.descriptor_id();
 
     let (mut chain, _) =
         LocalChain::from_genesis_hash(genesis_block(Network::Regtest).block_hash());
@@ -98,7 +100,11 @@ fn sync_returns_chain_and_graph_update() -> Result<()> {
         index.insert_descriptor(keychain.clone(), descriptor.clone())?;
         index
     });
-    let spk = graph.index.spk_at_index(keychain.clone(), 0).unwrap();
+    let spk_index = 2;
+    let spk = graph
+        .index
+        .spk_at_index(keychain.clone(), spk_index)
+        .unwrap();
     let recv_addr = bitcoin::Address::from_script(&spk, Network::Regtest).unwrap();
 
     // Mine blocks, and send tx to receiver.
@@ -117,8 +123,7 @@ fn sync_returns_chain_and_graph_update() -> Result<()> {
 
     // Sync
     let mut req = compact_filter::Request::<Keychain>::new(last_cp);
-    let target_index = 9;
-    req.add_descriptor(keychain.clone(), descriptor, 0..=target_index);
+    req.add_descriptor(keychain.clone(), descriptor, 0..20);
     let mut client = req.build_client(core);
     let compact_filter::Update {
         tip,
@@ -149,14 +154,14 @@ fn sync_returns_chain_and_graph_update() -> Result<()> {
     assert_eq!(txid, &sent_txid);
 
     // last revealed of keychain equal to `target_index`
-    let (_did, last_revealed) = graph_init_changeset
+    let (did, last_revealed) = graph_init_changeset
         .indexer
         .last_revealed
         .iter()
         .next()
         .unwrap();
-    // assert_eq!(k, &keychain);
-    assert_eq!(last_revealed, &target_index);
+    assert_eq!(did, &desc_id);
+    assert_eq!(last_revealed, &spk_index);
     let _ = graph.apply_changeset(graph_init_changeset);
 
     // balance updated
