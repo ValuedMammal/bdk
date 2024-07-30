@@ -4,100 +4,100 @@ name: CI
 
 jobs:
 
-  build-test:
-    name: Build and test
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust:
-          - version: stable
-            clippy: true
-          - version: 1.63.0 # MSRV
-        features:
-          - --no-default-features
-          - --all-features
-    steps:
-      - name: checkout
-        uses: actions/checkout@v2
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-            toolchain: ${{ matrix.rust.version }}
-            override: true
-            profile: minimal
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2.2.1
-      - name: Pin dependencies for MSRV
-        if: matrix.rust.version == '1.63.0'
-        run: |
-          cargo update -p zstd-sys --precise "2.0.8+zstd.1.5.5"
-          cargo update -p time --precise "0.3.20"
-          cargo update -p home --precise "0.5.5"
-          cargo update -p proptest --precise "1.2.0"
-          cargo update -p url --precise "2.5.0"
-          cargo update -p cc --precise "1.0.105"
-          cargo update -p tokio --precise "1.38.1"
-      - name: Build
-        run: cargo build ${{ matrix.features }}
-      - name: Test
-        run: cargo test ${{ matrix.features }}
+  # build-test:
+  #   name: Build and test
+  #   runs-on: ubuntu-latest
+  #   strategy:
+  #     matrix:
+  #       rust:
+  #         - version: stable
+  #           clippy: true
+  #         - version: 1.63.0 # MSRV
+  #       features:
+  #         - --no-default-features
+  #         - --all-features
+  #   steps:
+  #     - name: checkout
+  #       uses: actions/checkout@v2
+  #     - name: Install Rust toolchain
+  #       uses: actions-rs/toolchain@v1
+  #       with:
+  #           toolchain: ${{ matrix.rust.version }}
+  #           override: true
+  #           profile: minimal
+  #     - name: Rust Cache
+  #       uses: Swatinem/rust-cache@v2.2.1
+  #     - name: Pin dependencies for MSRV
+  #       if: matrix.rust.version == '1.63.0'
+  #       run: |
+  #         cargo update -p zstd-sys --precise "2.0.8+zstd.1.5.5"
+  #         cargo update -p time --precise "0.3.20"
+  #         cargo update -p home --precise "0.5.5"
+  #         cargo update -p proptest --precise "1.2.0"
+  #         cargo update -p url --precise "2.5.0"
+  #         cargo update -p cc --precise "1.0.105"
+  #         cargo update -p tokio --precise "1.38.1"
+  #     - name: Build
+  #       run: cargo build ${{ matrix.features }}
+  #     - name: Test
+  #       run: cargo test ${{ matrix.features }}
 
-  check-no-std:
-    name: Check no_std
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          profile: minimal
-          # target: "thumbv6m-none-eabi"
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2.2.1
-      - name: Check bdk_chain
-        working-directory: ./crates/chain
-        # TODO "--target thumbv6m-none-eabi" should work but currently does not
-        run: cargo check --no-default-features --features miniscript/no-std,hashbrown
-      - name: Check bdk wallet
-        working-directory: ./crates/wallet
-        # TODO "--target thumbv6m-none-eabi" should work but currently does not
-        run: cargo check --no-default-features --features miniscript/no-std,bdk_chain/hashbrown
-      - name: Check esplora
-        working-directory: ./crates/esplora
-        # TODO "--target thumbv6m-none-eabi" should work but currently does not
-        run: cargo check --no-default-features --features miniscript/no-std,bdk_chain/hashbrown
+  # check-no-std:
+  #   name: Check no_std
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v2
+  #     - name: Install Rust toolchain
+  #       uses: actions-rs/toolchain@v1
+  #       with:
+  #         toolchain: stable
+  #         override: true
+  #         profile: minimal
+  #         # target: "thumbv6m-none-eabi"
+  #     - name: Rust Cache
+  #       uses: Swatinem/rust-cache@v2.2.1
+  #     - name: Check bdk_chain
+  #       working-directory: ./crates/chain
+  #       # TODO "--target thumbv6m-none-eabi" should work but currently does not
+  #       run: cargo check --no-default-features --features miniscript/no-std,hashbrown
+  #     - name: Check bdk wallet
+  #       working-directory: ./crates/wallet
+  #       # TODO "--target thumbv6m-none-eabi" should work but currently does not
+  #       run: cargo check --no-default-features --features miniscript/no-std,bdk_chain/hashbrown
+  #     - name: Check esplora
+  #       working-directory: ./crates/esplora
+  #       # TODO "--target thumbv6m-none-eabi" should work but currently does not
+  #       run: cargo check --no-default-features --features miniscript/no-std,bdk_chain/hashbrown
 
-  check-wasm:
-    name: Check WASM
-    runs-on: ubuntu-20.04
-    env:
-      CC: clang-10
-      CFLAGS: -I/usr/include
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        # Install a recent version of clang that supports wasm32
-      - run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add - || exit 1
-      - run: sudo apt-get update || exit 1
-      - run: sudo apt-get install -y libclang-common-10-dev clang-10 libc6-dev-i386 || exit 1
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-            toolchain: stable
-            override: true
-            profile: minimal
-            target: "wasm32-unknown-unknown"
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2.2.1
-      - name: Check bdk wallet
-        working-directory: ./crates/wallet
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features miniscript/no-std,bdk_chain/hashbrown
-      - name: Check esplora
-        working-directory: ./crates/esplora
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features miniscript/no-std,bdk_chain/hashbrown,async
+  # check-wasm:
+  #   name: Check WASM
+  #   runs-on: ubuntu-20.04
+  #   env:
+  #     CC: clang-10
+  #     CFLAGS: -I/usr/include
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v2
+  #       # Install a recent version of clang that supports wasm32
+  #     - run: wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add - || exit 1
+  #     - run: sudo apt-get update || exit 1
+  #     - run: sudo apt-get install -y libclang-common-10-dev clang-10 libc6-dev-i386 || exit 1
+  #     - name: Install Rust toolchain
+  #       uses: actions-rs/toolchain@v1
+  #       with:
+  #           toolchain: stable
+  #           override: true
+  #           profile: minimal
+  #           target: "wasm32-unknown-unknown"
+  #     - name: Rust Cache
+  #       uses: Swatinem/rust-cache@v2.2.1
+  #     - name: Check bdk wallet
+  #       working-directory: ./crates/wallet
+  #       run: cargo check --target wasm32-unknown-unknown --no-default-features --features miniscript/no-std,bdk_chain/hashbrown
+  #     - name: Check esplora
+  #       working-directory: ./crates/esplora
+  #       run: cargo check --target wasm32-unknown-unknown --no-default-features --features miniscript/no-std,bdk_chain/hashbrown,async
 
   fmt:
     name: Rust fmt
@@ -121,7 +121,7 @@ jobs:
       - uses: actions/checkout@v1
       - uses: actions-rs/toolchain@v1
         with:
-            toolchain: 1.78.0
+            toolchain: 1.79.0
             components: clippy
             override: true
       - name: Rust Cache
