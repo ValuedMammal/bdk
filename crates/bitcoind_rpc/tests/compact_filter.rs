@@ -12,7 +12,6 @@ use bdk_testenv::bitcoind::Conf;
 use bitcoin::constants::genesis_block;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, Amount, BlockHash, Network, Txid};
-use bitcoincore_rpc;
 use bitcoincore_rpc::RpcApi;
 
 #[allow(unused)]
@@ -144,7 +143,7 @@ fn sync_returns_chain_and_graph_update() -> Result<()> {
     let txout = tx
         .output
         .iter()
-        .find(|txo| txo.script_pubkey == spk.to_owned())
+        .find(|txo| txo.script_pubkey == spk)
         .unwrap();
     assert_eq!(txout.value, send_amt);
 
@@ -162,7 +161,7 @@ fn sync_returns_chain_and_graph_update() -> Result<()> {
         .unwrap();
     assert_eq!(did, &desc_id);
     assert_eq!(last_revealed, &spk_index);
-    let _ = graph.apply_changeset(graph_init_changeset);
+    graph.apply_changeset(graph_init_changeset);
 
     // balance updated
     let balance = graph.graph().balance(

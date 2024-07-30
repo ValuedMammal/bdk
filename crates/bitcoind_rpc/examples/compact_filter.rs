@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
 
     // Apply updates
     let _ = chain.apply_update(tip)?;
-    let _ = graph.apply_changeset(indexed_tx_graph.initial_changeset());
+    graph.apply_changeset(indexed_tx_graph.initial_changeset());
 
     println!(
         "Local tip: {} : {}",
