@@ -36,8 +36,9 @@ use bdk_chain::{
 };
 use bitcoin::sighash::{EcdsaSighashType, TapSighashType};
 use bitcoin::{
-    absolute, psbt, Address, Block, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction,
-    TxOut, Txid, Witness,
+    absolute::{self, Height as BlockHeight},
+    psbt, Address, Block, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxOut,
+    Txid, Witness,
 };
 use bitcoin::{consensus::encode::serialize, transaction, BlockHash, Psbt};
 use bitcoin::{constants::genesis_block, Amount};
@@ -115,6 +116,7 @@ pub struct Wallet {
     change_signers: Arc<SignersContainer>,
     chain: LocalChain,
     indexed_graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
+    utxo_height_locks: HashMap<OutPoint, Option<BlockHeight>>,
     stage: ChangeSet,
     network: Network,
     secp: SecpCtx,
@@ -377,12 +379,15 @@ impl Wallet {
             network: Some(network),
         };
 
+        let utxo_height_locks = HashMap::new();
+
         Ok(Wallet {
             signers,
             change_signers,
             network,
             chain,
             indexed_graph,
+            utxo_height_locks,
             stage,
             secp,
         })
@@ -525,15 +530,20 @@ impl Wallet {
 
         let stage = ChangeSet::default();
 
-        Ok(Some(Wallet {
+        let mut wallet = Wallet {
             signers,
             change_signers,
             chain,
             indexed_graph,
+            utxo_height_locks: HashMap::new(),
             stage,
             network,
             secp,
-        }))
+        };
+
+        wallet.reload_coins();
+
+        Ok(Some(wallet))
     }
 
     /// Get the Bitcoin network the wallet is using.
@@ -1881,7 +1891,10 @@ impl Wallet {
     }
 
     fn get_available_utxos(&self) -> Vec<(LocalOutput, Weight)> {
+        let curr_height = BlockHeight::from_consensus(self.latest_checkpoint().height())
+            .expect("must be valid block height");
         self.list_unspent()
+            .filter(|utxo| !self.is_utxo_locked(&utxo.outpoint, curr_height))
             .map(|utxo| {
                 let keychain = utxo.keychain;
                 (utxo, {
@@ -2309,6 +2322,45 @@ impl Wallet {
             .indexed_graph
             .batch_insert_relevant_unconfirmed(unconfirmed_txs);
         self.stage.merge(indexed_graph_changeset.into());
+    }
+
+    /// Loads (or reloads) coins.
+    ///
+    /// Note this will automatically release any previously locked UTXOs.
+    pub fn reload_coins(&mut self) {
+        self.utxo_height_locks.clear();
+        let outpoints: Vec<_> = self.list_unspent().map(|u| u.outpoint).collect();
+        for op in outpoints {
+            self.utxo_height_locks.insert(op, None);
+        }
+    }
+
+    /// Locks the UTXO at `outpoint` for `n` blocks.
+    ///
+    /// Locking a utxo will exclude it from future rounds of coin selection until
+    /// the lock eventually expires. For example to lock spending an outpoint for
+    /// 3 blocks relative to the current height, pass 3 for the value of `n`.
+    pub fn lock_utxo(&mut self, outpoint: OutPoint, n: u32) {
+        let height = absolute::Height::from_consensus(self.latest_checkpoint().height() + n)
+            .expect("must be valid height");
+        self.utxo_height_locks.insert(outpoint, Some(height));
+    }
+
+    /// Returns `true` if the UTXO at `outpoint` is locked by the wallet given the current height.
+    fn is_utxo_locked(&self, outpoint: &OutPoint, current_height: BlockHeight) -> bool {
+        matches!(self.utxo_height_locks.get(outpoint), Some(height_lock)
+            if Some(current_height) < *height_lock
+        )
+    }
+
+    /// Iterate over wallet UTXOs that are currently locked.
+    pub fn locked_utxos(&self) -> impl Iterator<Item = OutPoint> + '_ {
+        let curr_height = BlockHeight::from_consensus(self.latest_checkpoint().height())
+            .expect("must be valid block height");
+        self.utxo_height_locks
+            .keys()
+            .copied()
+            .filter(move |op| self.is_utxo_locked(op, curr_height))
     }
 }
 

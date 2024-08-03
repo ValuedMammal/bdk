@@ -102,6 +102,41 @@ const P2WPKH_FAKE_WITNESS_SIZE: usize = 106;
 const DB_MAGIC: &[u8] = &[0x21, 0x24, 0x48];
 
 #[test]
+fn freeze_coins() {
+    let (mut wallet, _) = get_funded_wallet_wpkh();
+    // load coins
+    wallet.reload_coins();
+    let unspent: Vec<_> = wallet.list_unspent().collect();
+    assert_eq!(unspent.len(), 1);
+    let outpoint = unspent.first().unwrap().outpoint;
+
+    // now lock this outpoint for `n` blocks
+    // tx creation should fail with insufficient funds
+    let n = 2;
+    wallet.lock_utxo(outpoint, 2);
+    let locked: Vec<_> = wallet.locked_utxos().collect();
+    assert_eq!(locked.len(), 1);
+    assert_eq!(locked.first().unwrap(), &outpoint);
+    let spk = wallet
+        .next_unused_address(KeychainKind::External)
+        .script_pubkey();
+    let mut builder = wallet.build_tx();
+    builder.drain_to(spk.clone()).drain_wallet();
+    let _ = builder.finish().unwrap_err();
+
+    // advance the chain `n` blocks, should unlock utxo
+    let new_tip = BlockId {
+        height: wallet.latest_checkpoint().height() + n,
+        hash: BlockHash::all_zeros(),
+    };
+    wallet.insert_checkpoint(new_tip).unwrap();
+    let mut builder = wallet.build_tx();
+    builder.drain_to(spk).drain_wallet();
+    let _ = builder.finish().unwrap();
+    assert!(wallet.locked_utxos().next().is_none());
+}
+
+#[test]
 fn wallet_is_persisted() -> anyhow::Result<()> {
     fn run<Db, CreateDb, OpenDb>(
         filename: &str,
