@@ -165,12 +165,13 @@ where
             include_mempool,
         } = &self.param;
 
-        let mut emitter = Emitter::new(self.client, cp.block_id(), spks);
+        let mut filter_iter = FilterIter::new(self.client, cp.block_id(), spks);
 
         // Get new remote tip and consume events
         let mut blocks = vec![];
-        if emitter.get_tip()?.is_some() {
-            while let Some(event) = emitter.next_block()? {
+        if filter_iter.get_tip()?.is_some() {
+            for res in filter_iter {
+                let event = res?;
                 match event {
                     // Index tx data, and collect block id
                     Event::Block(inner) => {
@@ -215,7 +216,7 @@ where
 
 /// Type that emits [`Event`]s by matching a set of SPKs against a [`bip158::BlockFilter`].
 #[derive(Debug)]
-struct Emitter<'a, C> {
+struct FilterIter<'a, C> {
     // RPC client
     client: &'a C,
     // local tip block id
@@ -232,11 +233,11 @@ struct Emitter<'a, C> {
     stop: Height,
 }
 
-impl<'a, C> Emitter<'a, C>
+impl<'a, C> FilterIter<'a, C>
 where
     C: bitcoincore_rpc::RpcApi,
 {
-    /// Construct a new [`Emitter`].
+    /// Construct a new [`FilterIter`].
     fn new(client: &'a C, base: BlockId, spks: &'a [ScriptBuf]) -> Self {
         Self {
             client,
@@ -324,42 +325,44 @@ where
             hash: tip_hash,
         }))
     }
+}
 
-    /// Emits the next [`Event`]. Returns `Ok(None)` when all requested filters
-    /// have been processed.
-    fn next_block(&mut self) -> Result<Option<Event>, Error> {
-        let (id, filter) = match self.next_filter.clone() {
-            Some(f) => f,
-            None => return Ok(None),
-        };
+impl<'a, C: bitcoincore_rpc::RpcApi> Iterator for FilterIter<'a, C> {
+    type Item = Result<Event, Error>;
 
-        // If the next filter matches any of our watched SPKs,
-        // get the block and emit the event.
-        let height = id.height;
-        let hash = id.hash;
-        let event = if filter
-            .match_any(&hash, self.spks.iter().map(|script| script.as_bytes()))
-            .map_err(Error::Bip158)?
-        {
-            let block = self.client.get_block(&hash)?;
-            let event = EventInner {
-                id,
-                block: Some(block),
+    fn next(&mut self) -> Option<Self::Item> {
+        let (id, filter) = self.next_filter.clone()?;
+
+        (|| -> Result<Option<Event>, Error> {
+            // If the next filter matches any of our watched SPKs,
+            // get the block and emit the event.
+            let height = id.height;
+            let hash = id.hash;
+            let event = if filter
+                .match_any(&hash, self.spks.iter().map(|script| script.as_bytes()))
+                .map_err(Error::Bip158)?
+            {
+                let block = self.client.get_block(&hash)?;
+                let event = EventInner {
+                    id,
+                    block: Some(block),
+                };
+                Event::Block(event)
+
+            // Always emit block ids for the most recent fetched blocks
+            } else if self.blocks.contains_key(&height) {
+                let event = EventInner { id, block: None };
+                Event::Id(event)
+            } else {
+                Event::NoMatch
             };
-            Some(Event::Block(event))
 
-        // Always emit block ids for the most recent fetched blocks
-        } else if self.blocks.contains_key(&height) {
-            let event = EventInner { id, block: None };
-            Some(Event::Id(event))
-        } else {
-            Some(Event::NoMatch)
-        };
+            // Fetch and cache the next filter
+            self.next_filter = self.next_filter_increment()?;
 
-        // Fetch and cache the next filter
-        self.next_filter = self.next_filter_increment()?;
-
-        Ok(event)
+            Ok(Some(event))
+        })()
+        .transpose()
     }
 }
 
@@ -419,7 +422,7 @@ struct EventInner {
     block: Option<Block>,
 }
 
-/// Type of event emitted by [`Emitter`].
+/// Type of event emitted by [`FilterIter`].
 #[derive(Debug, Clone)]
 enum Event {
     /// Block
