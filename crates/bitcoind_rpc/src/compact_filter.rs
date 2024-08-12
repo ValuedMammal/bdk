@@ -2,15 +2,13 @@
 //!
 //! This module provides a method of chain syncing via [`BIP157`](https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki)
 //! compact block filters.
-//!
-//! # Example (TODO)
 
 use core::cmp;
 use core::fmt;
+use core::ops;
 use core::ops::Bound;
 use core::ops::RangeBounds;
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 
 use bdk_chain::bitcoin::{
     bip158::{self, BlockFilter},
@@ -23,6 +21,7 @@ use bdk_chain::miniscript::DescriptorPublicKey;
 use bdk_chain::SpkIterator;
 use bdk_chain::{BlockId, ConfirmationBlockTime, IndexedTxGraph};
 use bitcoincore_rpc;
+use bitcoincore_rpc::RpcApi;
 
 /// Block height
 type Height = u32;
@@ -103,7 +102,7 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
     }
 
     /// Finish building the request and return a new [`Client`] with the given RPC `client`.
-    pub fn build_client<C: bitcoincore_rpc::RpcApi>(self, client: &C) -> Client<C, K> {
+    pub fn build_client<C: RpcApi>(self, client: &C) -> Client<C, K> {
         // index and reveal the requested SPKs
         let mut indexer = KeychainTxOutIndex::default();
         let mut spks = vec![];
@@ -127,102 +126,35 @@ impl<K: fmt::Debug + Clone + Ord> Request<K> {
 
         Client {
             client,
-            indexed_graph: IndexedTxGraph::new(indexer),
-            param: Params {
-                cp: self.cp,
-                spks,
-                include_mempool: self.include_mempool,
-            },
-        }
-    }
-}
-
-/// Sync params.
-#[derive(Debug)]
-struct Params {
-    cp: CheckPoint,
-    spks: Vec<ScriptBuf>,
-    include_mempool: bool,
-}
-
-/// Type for executing a compact filters [`sync`](Client::sync).
-pub struct Client<'a, C, K> {
-    client: &'a C,
-    indexed_graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<K>>,
-    param: Params,
-}
-
-impl<'a, C, K> Client<'a, C, K>
-where
-    C: bitcoincore_rpc::RpcApi,
-    K: fmt::Debug + Clone + Ord,
-{
-    /// Sync to the new remote tip and return a new [`Update`].
-    pub fn sync(&mut self) -> Result<Update<K>, Error> {
-        let Params {
-            cp,
+            cp: self.cp,
             spks,
-            include_mempool,
-        } = &self.param;
-
-        let mut filter_iter = FilterIter::new(self.client, cp.block_id(), spks);
-
-        // Get new remote tip and consume events
-        let mut blocks = vec![];
-        if filter_iter.get_tip()?.is_some() {
-            for res in filter_iter {
-                let event = res?;
-                match event {
-                    // Index tx data, and collect block id
-                    Event::Block(inner) => {
-                        let EventInner { id, block } = inner;
-                        let _ = self
-                            .indexed_graph
-                            .apply_block_relevant(&block.expect("must have Block"), id.height);
-                        blocks.push(id);
-                    }
-
-                    // Collect block ids
-                    Event::Id(inner) => blocks.push(inner.id),
-
-                    // No match
-                    Event::NoMatch => continue,
-                }
-            }
+            include_mempool: self.include_mempool,
+            indexed_graph: IndexedTxGraph::new(indexer),
+            blocks: BTreeMap::new(),
+            next_filter: None,
+            height: 0,
+            stop: 0,
         }
-
-        // Query mempool for unconfirmed txs
-        if *include_mempool {
-            let unconfirmed = mempool(self.client, cp.clone())?;
-            let _ = self.indexed_graph.batch_insert_relevant_unconfirmed(
-                unconfirmed.iter().map(|(tx, time)| (tx, *time)),
-            );
-        }
-
-        // Construct update
-        let tip = if blocks.is_empty() {
-            cp.clone()
-        } else {
-            chain_update_tip(cp, blocks)
-        };
-        let indexed_tx_graph = core::mem::take(&mut self.indexed_graph);
-
-        Ok(Update {
-            tip,
-            indexed_tx_graph,
-        })
     }
 }
 
-/// Type that emits [`Event`]s by matching a set of SPKs against a [`bip158::BlockFilter`].
+/// Client
 #[derive(Debug)]
-struct FilterIter<'a, C> {
+pub struct Client<'a, C, K> {
     // RPC client
     client: &'a C,
-    // local tip block id
-    base: BlockId,
-    // raw SPK inventory
-    spks: &'a [ScriptBuf],
+
+    /* Params */
+    // local tip
+    cp: CheckPoint,
+    // SPK inventory
+    spks: Vec<ScriptBuf>,
+    // whether to query mempool txs
+    include_mempool: bool,
+
+    /* State */
+    // indexed tx graph
+    indexed_graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<K>>,
     // block map (height, hash)
     blocks: BTreeMap<Height, BlockHash>,
     // holds the next block filter
@@ -233,24 +165,8 @@ struct FilterIter<'a, C> {
     stop: Height,
 }
 
-impl<'a, C> FilterIter<'a, C>
-where
-    C: bitcoincore_rpc::RpcApi,
-{
-    /// Construct a new [`FilterIter`].
-    fn new(client: &'a C, base: BlockId, spks: &'a [ScriptBuf]) -> Self {
-        Self {
-            client,
-            base,
-            spks,
-            blocks: BTreeMap::new(),
-            next_filter: None,
-            height: 0,
-            stop: 0,
-        }
-    }
-
-    /// Get a [`BlockFilter`] by hash.
+impl<'a, C: RpcApi, K> Client<'a, C, K> {
+    /// Get [`BlockFilter`] by hash.
     fn get_filter(&self, hash: &BlockHash) -> Result<BlockFilter, Error> {
         let filter_bytes = self.client.get_block_filter(hash)?.filter;
         Ok(BlockFilter::new(&filter_bytes))
@@ -305,13 +221,12 @@ where
             .last()
             .expect("blocks not empty");
         let tip_hash = self.blocks[&tip_height];
-        let local_height = self.base.height;
-        let local_hash = self.base.hash;
+        let local_height = self.cp.height();
+        let local_hash = self.cp.hash();
         if local_height == tip_height && local_hash == tip_hash {
             // nothing to do
             return Ok(None);
         }
-
         // Force the starting height to be the minimum of (tip_height - 9) and (local_height + 1).
         let min_update_height = self.blocks.keys().next().expect("must have fetched blocks");
         self.height = cmp::min(*min_update_height, local_height + 1);
@@ -327,15 +242,71 @@ where
     }
 }
 
-impl<'a, C: bitcoincore_rpc::RpcApi> Iterator for FilterIter<'a, C> {
+impl<'a, C, K> Client<'a, C, K>
+where
+    C: RpcApi,
+    K: fmt::Debug + Clone + Ord,
+{
+    /// Sync to the new remote tip and return a new [`Update`].
+    pub fn sync(mut self) -> Result<Option<Update<K>>, Error> {
+        if self.get_tip()?.is_none() {
+            return Ok(None);
+        }
+
+        let mut it = FilterIter::new(&mut self);
+        while let Some(res) = it.next() {
+            let event = res?;
+            match event {
+                // Index tx data
+                Event::Block(inner) => {
+                    let EventInner { height, block } = inner;
+                    let _ = it.indexed_graph.apply_block_relevant(&block, height);
+                }
+                // No match
+                Event::NoMatch => continue,
+            }
+        }
+
+        // Query mempool for unconfirmed txs
+        if self.include_mempool {
+            let unconfirmed = mempool(self.client, self.cp.clone())?;
+            let _ = self.indexed_graph.batch_insert_relevant_unconfirmed(
+                unconfirmed.iter().map(|(tx, time)| (tx, *time)),
+            );
+        }
+
+        // Construct update
+        let tip = self.chain_update()?;
+        let indexed_tx_graph = self.indexed_graph;
+
+        Ok(Some(Update {
+            tip,
+            indexed_tx_graph,
+        }))
+    }
+}
+
+/// Type that produces [`Event`]s by matching a set of SPKs against a [`bip158::BlockFilter`].
+#[derive(Debug)]
+struct FilterIter<'b, 'a, C, K> {
+    inner: &'b mut Client<'a, C, K>,
+}
+
+impl<'b, 'a, C, K> FilterIter<'b, 'a, C, K> {
+    fn new(inner: &'b mut Client<'a, C, K>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'b, 'a, C: RpcApi, K> Iterator for FilterIter<'b, 'a, C, K> {
     type Item = Result<Event, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (id, filter) = self.next_filter.clone()?;
+        let (id, filter) = self.inner.next_filter.clone()?;
 
-        (|| -> Result<Option<Event>, Error> {
-            // If the next filter matches any of our watched SPKs,
-            // get the block and emit the event.
+        (|| -> Result<_, Error> {
+            // If the next filter matches any of our watched SPKs, get the block
+            // and return it, inserting any new block ids into self.
             let height = id.height;
             let hash = id.hash;
             let event = if filter
@@ -343,22 +314,15 @@ impl<'a, C: bitcoincore_rpc::RpcApi> Iterator for FilterIter<'a, C> {
                 .map_err(Error::Bip158)?
             {
                 let block = self.client.get_block(&hash)?;
-                let event = EventInner {
-                    id,
-                    block: Some(block),
-                };
-                Event::Block(event)
-
-            // Always emit block ids for the most recent fetched blocks
-            } else if self.blocks.contains_key(&height) {
-                let event = EventInner { id, block: None };
-                Event::Id(event)
+                self.blocks.insert(height, hash);
+                let inner = EventInner { height, block };
+                Event::Block(inner)
             } else {
                 Event::NoMatch
             };
 
             // Fetch and cache the next filter
-            self.next_filter = self.next_filter_increment()?;
+            self.next_filter = self.inner.next_filter_increment()?;
 
             Ok(Some(event))
         })()
@@ -366,42 +330,69 @@ impl<'a, C: bitcoincore_rpc::RpcApi> Iterator for FilterIter<'a, C> {
     }
 }
 
+impl<'b, 'a, C, K> ops::Deref for FilterIter<'b, 'a, C, K> {
+    type Target = Client<'a, C, K>;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner
+    }
+}
+
+impl<'b, 'a, C, K> ops::DerefMut for FilterIter<'b, 'a, C, K> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+    }
+}
+
 /// Emit mempool transactions, alongside their first-seen unix timestamps.
 ///
 /// This will internally call the corresponding method on [`Emitter`](crate::Emitter).
 /// See [`super::Emitter::mempool`].
-fn mempool<C: bitcoincore_rpc::RpcApi>(
-    client: &C,
-    cp: CheckPoint,
-) -> Result<Vec<(Transaction, UnixTime)>, Error> {
+fn mempool<C: RpcApi>(client: &C, cp: CheckPoint) -> Result<Vec<(Transaction, UnixTime)>, Error> {
     // since this is a dummy Emitter, we can use a start height of 0.
     let mut emitter = super::Emitter::new(client, cp, 0);
     emitter.mempool().map_err(Error::Rpc)
 }
 
-/// Craft the new update tip
-fn chain_update_tip(cp: &CheckPoint, block_ids: impl IntoIterator<Item = BlockId>) -> CheckPoint {
-    let block_ids: BTreeSet<BlockId> = block_ids.into_iter().collect();
-    let min_update_height = block_ids
-        .iter()
-        .next()
-        .expect("blocks must not be empty")
-        .height;
-    let local_height = cp.height();
+impl<'a, C: RpcApi, K> Client<'a, C, K> {
+    /// Fetches block either from `self` or from the RPC client, ensuring
+    /// the block then exists in `self` (used to form a chain update).
+    fn fetch_block(&mut self, height: Height) -> Result<BlockId, Error> {
+        if height == 0 {
+            return Ok(self.cp.get(height).expect("must have genesis").block_id());
+        }
+        let hash = match self.blocks.get(&height) {
+            Some(hash) => *hash,
+            None => {
+                let hash = self.client.get_block_hash(height as _)?;
+                self.blocks.insert(height, hash);
+                hash
+            }
+        };
+        Ok(BlockId { height, hash })
+    }
 
-    let base = if local_height >= min_update_height {
-        // find next lowest base to build on
-        cp.iter()
-            .find(|cp| cp.height() < min_update_height)
-            .expect("fallback to genesis")
-            .block_id()
-    } else {
-        cp.block_id()
-    };
+    /// Craft the new update tip.
+    fn chain_update(&mut self) -> Result<CheckPoint, Error> {
+        let mut base = Option::<BlockId>::None;
 
-    CheckPoint::new(base)
-        .extend(block_ids)
-        .expect("blocks are well ordered")
+        // find PoA
+        for local_cp in self.cp.iter() {
+            let height = local_cp.height();
+            let remote_hash = self.fetch_block(height)?.hash;
+            if local_cp.hash() == remote_hash {
+                base = Some(local_cp.block_id());
+                break;
+            }
+        }
+
+        let mut cp = CheckPoint::new(base.expect("must find PoA"));
+        for block in self.blocks.iter().map(BlockId::from) {
+            cp = cp.insert(block);
+        }
+
+        Ok(cp)
+    }
 }
 
 /// An update returned from a compact filters [`sync`](Client::sync).
@@ -416,10 +407,10 @@ pub struct Update<K> {
 /// Event inner type.
 #[derive(Debug, Clone)]
 struct EventInner {
-    /// Block id
-    id: BlockId,
+    /// Height
+    height: Height,
     /// Block
-    block: Option<Block>,
+    block: Block,
 }
 
 /// Type of event emitted by [`FilterIter`].
@@ -427,8 +418,6 @@ struct EventInner {
 enum Event {
     /// Block
     Block(EventInner),
-    /// Block Id
-    Id(EventInner),
     /// No match
     NoMatch,
 }

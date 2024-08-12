@@ -24,7 +24,7 @@ impl TestEnv {
         let mut conf = Conf::default();
         conf.args.push("-blockfilterindex=1");
         conf.args.push("-peerblockfilters=1");
-        let exe = std::env::var("TEST_BITCOIND").unwrap_or(bitcoind::downloaded_exe_path()?);
+        let exe = std::env::var("BITCOIND_EXE").unwrap_or(bitcoind::downloaded_exe_path()?);
         let bitcoind = BitcoinD::with_conf(exe, &conf)?;
 
         Ok(Self { bitcoind })
@@ -45,10 +45,8 @@ impl TestEnv {
     }
 
     fn block_until_height(&self, height: u64) -> Result<()> {
-        let mut delay = std::time::Duration::from_millis(64);
         while self.client().get_block_count()? < height {
-            std::thread::sleep(delay);
-            delay *= 2;
+            std::thread::sleep(std::time::Duration::from_millis(256));
         }
         Ok(())
     }
@@ -122,12 +120,12 @@ fn sync_returns_chain_and_graph_update() -> Result<()> {
 
     // Sync
     let mut req = compact_filter::Request::<Keychain>::new(last_cp);
-    req.add_descriptor(keychain.clone(), descriptor, 0..20);
-    let mut client = req.build_client(core);
+    req.add_descriptor(keychain.clone(), descriptor, 0..10);
+    let client = req.build_client(core);
     let compact_filter::Update {
         tip,
         indexed_tx_graph,
-    } = client.sync()?;
+    } = client.sync()?.unwrap();
 
     // Apply updates
     let chain_changeset = chain.apply_update(tip)?;

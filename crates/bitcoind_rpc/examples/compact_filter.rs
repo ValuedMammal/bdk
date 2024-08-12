@@ -52,17 +52,18 @@ fn main() -> anyhow::Result<()> {
         request.add_descriptor(k, desc.clone(), 0..SPK_COUNT);
     }
 
-    let mut client = request.build_client(&rpc_client);
+    let client = request.build_client(&rpc_client);
 
     // Sync
-    let compact_filter::Update {
+    if let Some(compact_filter::Update {
         tip,
         indexed_tx_graph,
-    } = client.sync()?;
-
-    // Apply updates
-    let _ = chain.apply_update(tip)?;
-    graph.apply_changeset(indexed_tx_graph.initial_changeset());
+    }) = client.sync()?
+    {
+        // Apply updates
+        let _ = chain.apply_update(tip)?;
+        graph.apply_changeset(indexed_tx_graph.initial_changeset());
+    }
 
     let cp = chain.tip();
     let index = &graph.index;

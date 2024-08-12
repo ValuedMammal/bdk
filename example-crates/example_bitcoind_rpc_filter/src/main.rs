@@ -166,11 +166,10 @@ fn main() -> anyhow::Result<()> {
             };
 
             // Sync
-            let Update {
+            if let Some(Update {
                 tip,
                 indexed_tx_graph,
-            } = client.sync()?;
-
+            }) = client.sync()?
             {
                 // Apply updates
                 let mut chain = chain.lock().unwrap();
