@@ -13,9 +13,9 @@
 
 use crate::descriptor::policy::PolicyError;
 use crate::descriptor::DescriptorError;
-use crate::wallet::coin_selection;
 use crate::{descriptor, KeychainKind};
 use alloc::string::String;
+use bdk_transaction::coin_selection;
 use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, Txid};
 use core::fmt;
 
@@ -44,9 +44,9 @@ impl fmt::Display for MiniscriptPsbtError {
 impl std::error::Error for MiniscriptPsbtError {}
 
 #[derive(Debug)]
-/// Error returned from [`TxBuilder::finish`]
+/// Error returned from [`build_tx`].
 ///
-/// [`TxBuilder::finish`]: crate::wallet::tx_builder::TxBuilder::finish
+/// [`build_tx`]: crate::TxBuilderExt::build_tx
 pub enum CreateTxError {
     /// There was a problem with the descriptors passed in
     Descriptor(DescriptorError),
@@ -96,7 +96,7 @@ pub enum CreateTxError {
     /// key in the descriptor must either be a master key itself (having depth = 0) or have an
     /// explicit origin provided
     ///
-    /// [`TxBuilder::add_global_xpubs`]: crate::wallet::tx_builder::TxBuilder::add_global_xpubs
+    /// [`TxBuilder::add_global_xpubs`]: bdk_transaction::TxBuilder::add_global_xpubs
     MissingKeyOrigin(String),
     /// Happens when trying to spend an UTXO that is not in the internal database
     UnknownUtxo,

@@ -9,34 +9,13 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-use bitcoin::secp256k1::{All, Secp256k1};
-use bitcoin::{absolute, relative, Amount, Script, Sequence};
-
+use bdk_transaction::CandidateUtxo;
+use bitcoin::{
+    absolute, relative,
+    secp256k1::{All, Secp256k1},
+    OutPoint, Sequence,
+};
 use miniscript::{MiniscriptKey, Satisfier, ToPublicKey};
-
-use rand_core::RngCore;
-
-/// Trait to check if a value is below the dust limit.
-/// We are performing dust value calculation for a given script public key using rust-bitcoin to
-/// keep it compatible with network dust rate
-// we implement this trait to make sure we don't mess up the comparison with off-by-one like a <
-// instead of a <= etc.
-pub trait IsDust {
-    /// Check whether or not a value is below dust limit
-    fn is_dust(&self, script: &Script) -> bool;
-}
-
-impl IsDust for Amount {
-    fn is_dust(&self, script: &Script) -> bool {
-        *self < script.minimal_non_dust()
-    }
-}
-
-impl IsDust for u64 {
-    fn is_dust(&self, script: &Script) -> bool {
-        Amount::from_sat(*self).is_dust(script)
-    }
-}
 
 pub struct After {
     pub current_height: Option<u32>,
@@ -118,20 +97,27 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for Older {
     }
 }
 
-// The Knuth shuffling algorithm based on the original [Fisher-Yates method](https://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle)
-pub(crate) fn shuffle_slice<T>(list: &mut [T], rng: &mut impl RngCore) {
-    if list.is_empty() {
-        return;
-    }
-    let mut current_index = list.len() - 1;
-    while current_index > 0 {
-        let random_index = rng.next_u32() as usize % (current_index + 1);
-        list.swap(current_index, random_index);
-        current_index -= 1;
-    }
-}
-
 pub(crate) type SecpCtx = Secp256k1<All>;
+
+/// Remove duplicate UTXOs.
+///
+/// If a UTXO appears in both `required` and `optional`, the appearance in `required` is kept.
+pub(crate) fn filter_duplicates<I>(required: I, optional: I) -> (I, I)
+where
+    I: IntoIterator<Item = CandidateUtxo> + FromIterator<CandidateUtxo>,
+{
+    use crate::collections::HashSet;
+    let mut visited = HashSet::<OutPoint>::new();
+    let required = required
+        .into_iter()
+        .filter(|utxo| visited.insert(utxo.outpoint))
+        .collect::<I>();
+    let optional = optional
+        .into_iter()
+        .filter(|utxo| visited.insert(utxo.outpoint))
+        .collect::<I>();
+    (required, optional)
+}
 
 #[cfg(test)]
 mod test {
@@ -139,32 +125,8 @@ mod test {
     // otherwise it's time-based
     pub(crate) const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 
-    use super::{check_nsequence_rbf, shuffle_slice, IsDust};
-    use crate::bitcoin::{Address, Network, Sequence};
-    use alloc::vec::Vec;
-    use core::str::FromStr;
-    use rand::{rngs::StdRng, thread_rng, SeedableRng};
-
-    #[test]
-    fn test_is_dust() {
-        let script_p2pkh = Address::from_str("1GNgwA8JfG7Kc8akJ8opdNWJUihqUztfPe")
-            .unwrap()
-            .require_network(Network::Bitcoin)
-            .unwrap()
-            .script_pubkey();
-        assert!(script_p2pkh.is_p2pkh());
-        assert!(545.is_dust(&script_p2pkh));
-        assert!(!546.is_dust(&script_p2pkh));
-
-        let script_p2wpkh = Address::from_str("bc1qxlh2mnc0yqwas76gqq665qkggee5m98t8yskd8")
-            .unwrap()
-            .require_network(Network::Bitcoin)
-            .unwrap()
-            .script_pubkey();
-        assert!(script_p2wpkh.is_p2wpkh());
-        assert!(293.is_dust(&script_p2wpkh));
-        assert!(!294.is_dust(&script_p2wpkh));
-    }
+    use super::check_nsequence_rbf;
+    use crate::bitcoin::Sequence;
 
     #[test]
     fn test_check_nsequence_rbf_msb_set() {
@@ -204,47 +166,5 @@ mod test {
             Sequence(SEQUENCE_LOCKTIME_TYPE_FLAG + 5000),
         );
         assert!(result);
-    }
-
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_shuffle_slice_empty_vec() {
-        let mut test: Vec<u8> = vec![];
-        shuffle_slice(&mut test, &mut thread_rng());
-    }
-
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_shuffle_slice_single_vec() {
-        let mut test: Vec<u8> = vec![0];
-        shuffle_slice(&mut test, &mut thread_rng());
-    }
-
-    #[test]
-    fn test_shuffle_slice_duple_vec() {
-        let seed = [0; 32];
-        let mut rng: StdRng = SeedableRng::from_seed(seed);
-        let mut test: Vec<u8> = vec![0, 1];
-        shuffle_slice(&mut test, &mut rng);
-        assert_eq!(test, &[0, 1]);
-        let seed = [6; 32];
-        let mut rng: StdRng = SeedableRng::from_seed(seed);
-        let mut test: Vec<u8> = vec![0, 1];
-        shuffle_slice(&mut test, &mut rng);
-        assert_eq!(test, &[1, 0]);
-    }
-
-    #[test]
-    fn test_shuffle_slice_multi_vec() {
-        let seed = [0; 32];
-        let mut rng: StdRng = SeedableRng::from_seed(seed);
-        let mut test: Vec<u8> = vec![0, 1, 2, 4, 5];
-        shuffle_slice(&mut test, &mut rng);
-        assert_eq!(test, &[2, 1, 0, 4, 5]);
-        let seed = [25; 32];
-        let mut rng: StdRng = SeedableRng::from_seed(seed);
-        let mut test: Vec<u8> = vec![0, 1, 2, 4, 5];
-        shuffle_slice(&mut test, &mut rng);
-        assert_eq!(test, &[0, 4, 1, 2, 5]);
     }
 }

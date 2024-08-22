@@ -5,7 +5,7 @@ use bdk_esplora::{esplora_client, EsploraAsyncExt};
 use bdk_wallet::{
     bitcoin::{Amount, Network},
     rusqlite::Connection,
-    KeychainKind, SignOptions, Wallet,
+    KeychainKind, SignOptions, TxBuilderExt, Wallet,
 };
 
 const SEND_AMOUNT: Amount = Amount::from_sat(5000);
@@ -76,10 +76,10 @@ async fn main() -> Result<(), anyhow::Error> {
         std::process::exit(0);
     }
 
-    let mut tx_builder = wallet.build_tx();
+    let mut tx_builder = wallet.tx_builder();
     tx_builder.add_recipient(address.script_pubkey(), SEND_AMOUNT);
 
-    let mut psbt = tx_builder.finish()?;
+    let mut psbt = tx_builder.build_tx()?;
     let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
     assert!(finalized);
 

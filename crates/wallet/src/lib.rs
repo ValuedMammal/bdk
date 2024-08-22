@@ -28,6 +28,7 @@ pub extern crate serde_json;
 pub mod descriptor;
 pub mod keys;
 pub mod psbt;
+mod tx_builder_ext;
 mod types;
 mod wallet;
 
@@ -40,7 +41,7 @@ pub use descriptor::template;
 pub use descriptor::HdKeyPaths;
 pub use signer;
 pub use signer::SignOptions;
-pub use tx_builder::*;
+pub use tx_builder_ext::TxBuilderExt;
 pub use types::*;
 pub use wallet::*;
 

@@ -9,116 +9,27 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-//! Coin selection
+//! Legacy coin selection module ported from `bdk_wallet`
 //!
 //! This module provides the trait [`CoinSelectionAlgorithm`] that can be implemented to
 //! define custom coin selection algorithms.
 //!
-//! You can specify a custom coin selection algorithm through the [`coin_selection`] method on
-//! [`TxBuilder`]. [`DefaultCoinSelectionAlgorithm`] aliases the coin selection algorithm that will
+//! [`DefaultCoinSelectionAlgorithm`] aliases the coin selection algorithm that will
 //! be used if it is not explicitly set.
-//!
-//! [`TxBuilder`]: super::tx_builder::TxBuilder
-//! [`coin_selection`]: super::tx_builder::TxBuilder::coin_selection
-//!
-//! ## Example
-//!
-//! ```
-//! # use std::str::FromStr;
-//! # use bitcoin::*;
-//! # use bdk_wallet::{self, ChangeSet, coin_selection::*, coin_selection};
-//! # use bdk_wallet::error::CreateTxError;
-//! # use bdk_wallet::*;
-//! # use bdk_wallet::coin_selection::decide_change;
-//! # use anyhow::Error;
-//! # use rand_core::RngCore;
-//! #[derive(Debug)]
-//! struct AlwaysSpendEverything;
-//!
-//! impl CoinSelectionAlgorithm for AlwaysSpendEverything {
-//!     fn coin_select<R: RngCore>(
-//!         &self,
-//!         required_utxos: Vec<WeightedUtxo>,
-//!         optional_utxos: Vec<WeightedUtxo>,
-//!         fee_rate: FeeRate,
-//!         target_amount: u64,
-//!         drain_script: &Script,
-//!         rand: &mut R,
-//!     ) -> Result<CoinSelectionResult, coin_selection::InsufficientFunds> {
-//!         let mut selected_amount = 0;
-//!         let mut additional_weight = Weight::ZERO;
-//!         let all_utxos_selected = required_utxos
-//!             .into_iter()
-//!             .chain(optional_utxos)
-//!             .scan(
-//!                 (&mut selected_amount, &mut additional_weight),
-//!                 |(selected_amount, additional_weight), weighted_utxo| {
-//!                     **selected_amount += weighted_utxo.utxo.txout().value.to_sat();
-//!                     **additional_weight += TxIn::default()
-//!                         .segwit_weight()
-//!                         .checked_add(weighted_utxo.satisfaction_weight)
-//!                         .expect("`Weight` addition should not cause an integer overflow");
-//!                     Some(weighted_utxo.utxo)
-//!                 },
-//!             )
-//!             .collect::<Vec<_>>();
-//!         let additional_fees = (fee_rate * additional_weight).to_sat();
-//!         let amount_needed_with_fees = additional_fees + target_amount;
-//!         if selected_amount < amount_needed_with_fees {
-//!             return Err(coin_selection::InsufficientFunds {
-//!                 needed: amount_needed_with_fees,
-//!                 available: selected_amount,
-//!             });
-//!         }
-//!
-//!         let remaining_amount = selected_amount - amount_needed_with_fees;
-//!
-//!         let excess = decide_change(remaining_amount, fee_rate, drain_script);
-//!
-//!         Ok(CoinSelectionResult {
-//!             selected: all_utxos_selected,
-//!             fee_amount: additional_fees,
-//!             excess,
-//!         })
-//!     }
-//! }
-//!
-//! # let mut wallet = doctest_wallet!();
-//! // create wallet, sync, ...
-//!
-//! let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt")
-//!     .unwrap()
-//!     .require_network(Network::Testnet)
-//!     .unwrap();
-//! let psbt = {
-//!     let mut builder = wallet.build_tx().coin_selection(AlwaysSpendEverything);
-//!     builder.add_recipient(to_address.script_pubkey(), Amount::from_sat(50_000));
-//!     builder.finish()?
-//! };
-//!
-//! // inspect, sign, broadcast, ...
-//!
-//! # Ok::<(), anyhow::Error>(())
-//! ```
 
-use crate::chain::collections::HashSet;
-use crate::wallet::utils::IsDust;
-use crate::Utxo;
-use crate::WeightedUtxo;
-use bitcoin::FeeRate;
-
+use alloc::vec;
 use alloc::vec::Vec;
-use bitcoin::consensus::encode::serialize;
-use bitcoin::OutPoint;
-use bitcoin::TxIn;
-use bitcoin::{Script, Weight};
-
 use core::convert::TryInto;
 use core::fmt::{self, Formatter};
+
+use bdk_chain::bitcoin;
+use bitcoin::{consensus::encode::serialize, Amount, FeeRate, Script, TxIn, Weight};
 use rand_core::RngCore;
 
-use super::utils::shuffle_slice;
-/// Default coin selection algorithm used by [`TxBuilder`](super::tx_builder::TxBuilder) if not
+use crate::util;
+use crate::CandidateUtxo;
+
+/// Default coin selection algorithm used by [`TxBuilder`](crate::TxBuilder) if not
 /// overridden
 pub type DefaultCoinSelectionAlgorithm = BranchAndBoundCoinSelection<SingleRandomDraw>;
 
@@ -169,60 +80,63 @@ pub enum Excess {
 
 /// Result of a successful coin selection
 #[derive(Debug)]
-pub struct CoinSelectionResult {
+pub struct Selection {
     /// List of outputs selected for use as inputs
-    pub selected: Vec<Utxo>,
+    pub selected: Vec<CandidateUtxo>,
     /// Total fee amount for the selected utxos in satoshis
     pub fee_amount: u64,
     /// Remaining amount after deducing fees and outgoing outputs
     pub excess: Excess,
 }
 
-impl CoinSelectionResult {
+impl Selection {
     /// The total value of the inputs selected.
     pub fn selected_amount(&self) -> u64 {
-        self.selected.iter().map(|u| u.txout().value.to_sat()).sum()
-    }
-
-    /// The total value of the inputs selected from the local wallet.
-    pub fn local_selected_amount(&self) -> u64 {
         self.selected
             .iter()
-            .filter_map(|u| match u {
-                Utxo::Local(_) => Some(u.txout().value.to_sat()),
-                _ => None,
-            })
+            .map(|u| u.txout().expect("candidate must have txout").value.to_sat())
             .sum()
+    }
+}
+
+/// Trait to check if a value is below the dust limit.
+/// We are performing dust value calculation for a given script public key using rust-bitcoin to
+/// keep it compatible with network dust rate
+// we implement this trait to make sure we don't mess up the comparison with off-by-one like a <
+// instead of a <= etc.
+pub trait IsDust {
+    /// Check whether or not a value is below dust limit
+    fn is_dust(&self, script: &Script) -> bool;
+}
+
+impl IsDust for Amount {
+    fn is_dust(&self, script: &Script) -> bool {
+        *self < script.minimal_non_dust()
+    }
+}
+
+impl IsDust for u64 {
+    fn is_dust(&self, script: &Script) -> bool {
+        Amount::from_sat(*self).is_dust(script)
     }
 }
 
 /// Trait for generalized coin selection algorithms
 ///
-/// This trait can be implemented to make the [`Wallet`](super::Wallet) use a customized coin
-/// selection algorithm when it creates transactions.
-///
-/// For an example see [this module](crate::wallet::coin_selection)'s documentation.
-pub trait CoinSelectionAlgorithm: core::fmt::Debug {
-    /// Perform the coin selection
-    ///
-    /// - `required_utxos`: the utxos that must be spent regardless of `target_amount` with their
-    ///                     weight cost
-    /// - `optional_utxos`: the remaining available utxos to satisfy `target_amount` with their
-    ///                     weight cost
-    /// - `fee_rate`: fee rate to use
-    /// - `target_amount`: the outgoing amount in satoshis and the fees already
-    ///                    accumulated from added outputs and transaction’s header.
-    /// - `drain_script`: the script to use in case of change
-    /// - `rand`: random number generated used by some coin selection algorithms such as [`SingleRandomDraw`]
+/// This trait can be implemented to enable using a customized coin selection algorithm
+/// when creating transactions.
+pub trait CoinSelectionAlgorithm: core::fmt::Debug + Default + Clone {
+    /// Attempt to find a selection of candidates sufficient to meet the target amount at the given feerate.
+    /// TODO: describe parameters
     fn coin_select<R: RngCore>(
         &self,
-        required_utxos: Vec<WeightedUtxo>,
-        optional_utxos: Vec<WeightedUtxo>,
+        required_utxos: Vec<CandidateUtxo>,
+        optional_utxos: Vec<CandidateUtxo>,
         fee_rate: FeeRate,
         target_amount: u64,
         drain_script: &Script,
         rand: &mut R,
-    ) -> Result<CoinSelectionResult, InsufficientFunds>;
+    ) -> Result<Selection, InsufficientFunds>;
 }
 
 /// Simple and dumb coin selection
@@ -235,17 +149,18 @@ pub struct LargestFirstCoinSelection;
 impl CoinSelectionAlgorithm for LargestFirstCoinSelection {
     fn coin_select<R: RngCore>(
         &self,
-        required_utxos: Vec<WeightedUtxo>,
-        mut optional_utxos: Vec<WeightedUtxo>,
+        required_utxos: Vec<CandidateUtxo>,
+        mut optional_utxos: Vec<CandidateUtxo>,
         fee_rate: FeeRate,
         target_amount: u64,
         drain_script: &Script,
         _: &mut R,
-    ) -> Result<CoinSelectionResult, InsufficientFunds> {
+    ) -> Result<Selection, InsufficientFunds> {
         // We put the "required UTXOs" first and make sure the optional UTXOs are sorted,
         // initially smallest to largest, before being reversed with `.rev()`.
         let utxos = {
-            optional_utxos.sort_unstable_by_key(|wu| wu.utxo.txout().value);
+            optional_utxos
+                .sort_unstable_by_key(|utxo| utxo.txout().expect("must have txout").value);
             required_utxos
                 .into_iter()
                 .map(|utxo| (true, utxo))
@@ -266,21 +181,18 @@ pub struct OldestFirstCoinSelection;
 impl CoinSelectionAlgorithm for OldestFirstCoinSelection {
     fn coin_select<R: RngCore>(
         &self,
-        required_utxos: Vec<WeightedUtxo>,
-        mut optional_utxos: Vec<WeightedUtxo>,
+        required_utxos: Vec<CandidateUtxo>,
+        mut optional_utxos: Vec<CandidateUtxo>,
         fee_rate: FeeRate,
         target_amount: u64,
         drain_script: &Script,
         _: &mut R,
-    ) -> Result<CoinSelectionResult, InsufficientFunds> {
+    ) -> Result<Selection, InsufficientFunds> {
         // We put the "required UTXOs" first and make sure the optional UTXOs are sorted from
         // oldest to newest according to blocktime
-        // For utxo that doesn't exist in DB, they will have lowest priority to be selected
+        // Foreign utxos will have lowest priority to be selected
         let utxos = {
-            optional_utxos.sort_unstable_by_key(|wu| match &wu.utxo {
-                Utxo::Local(local) => Some(local.confirmation_time),
-                Utxo::Foreign { .. } => None,
-            });
+            optional_utxos.sort_unstable_by_key(|utxo| utxo.confirmation_time);
 
             required_utxos
                 .into_iter()
@@ -320,26 +232,26 @@ pub fn decide_change(remaining_amount: u64, fee_rate: FeeRate, drain_script: &Sc
 }
 
 fn select_sorted_utxos(
-    utxos: impl Iterator<Item = (bool, WeightedUtxo)>,
+    utxos: impl Iterator<Item = (bool, CandidateUtxo)>,
     fee_rate: FeeRate,
     target_amount: u64,
     drain_script: &Script,
-) -> Result<CoinSelectionResult, InsufficientFunds> {
+) -> Result<Selection, InsufficientFunds> {
     let mut selected_amount = 0;
     let mut fee_amount = 0;
     let selected = utxos
         .scan(
             (&mut selected_amount, &mut fee_amount),
-            |(selected_amount, fee_amount), (must_use, weighted_utxo)| {
+            |(selected_amount, fee_amount), (must_use, utxo)| {
                 if must_use || **selected_amount < target_amount + **fee_amount {
                     **fee_amount += (fee_rate
                         * (TxIn::default()
                             .segwit_weight()
-                            .checked_add(weighted_utxo.satisfaction_weight)
+                            .checked_add(utxo.satisfaction_weight)
                             .expect("`Weight` addition should not cause an integer overflow")))
                     .to_sat();
-                    **selected_amount += weighted_utxo.utxo.txout().value.to_sat();
-                    Some(weighted_utxo.utxo)
+                    **selected_amount += utxo.txout().expect("must have txout").value.to_sat();
+                    Some(utxo)
                 } else {
                     None
                 }
@@ -359,7 +271,7 @@ fn select_sorted_utxos(
 
     let excess = decide_change(remaining_amount, fee_rate, drain_script);
 
-    Ok(CoinSelectionResult {
+    Ok(Selection {
         selected,
         fee_amount,
         excess,
@@ -368,28 +280,35 @@ fn select_sorted_utxos(
 
 #[derive(Debug, Clone)]
 // Adds fee information to an UTXO.
-struct OutputGroup {
-    weighted_utxo: WeightedUtxo,
+struct EffectiveUtxo {
+    utxo: CandidateUtxo,
     // Amount of fees for spending a certain utxo, calculated using a certain FeeRate
     fee: u64,
     // The effective value of the UTXO, i.e., the utxo value minus the fee for spending it
     effective_value: i64,
 }
 
-impl OutputGroup {
-    fn new(weighted_utxo: WeightedUtxo, fee_rate: FeeRate) -> Self {
+impl EffectiveUtxo {
+    /// Create new effective utxo from a candidate and feerate
+    fn new(utxo: CandidateUtxo, fee_rate: FeeRate) -> Self {
         let fee = (fee_rate
             * (TxIn::default()
                 .segwit_weight()
-                .checked_add(weighted_utxo.satisfaction_weight)
+                .checked_add(utxo.satisfaction_weight)
                 .expect("`Weight` addition should not cause an integer overflow")))
         .to_sat();
-        let effective_value = weighted_utxo.utxo.txout().value.to_sat() as i64 - fee as i64;
-        OutputGroup {
-            weighted_utxo,
+        let effective_value =
+            utxo.txout().expect("must have txout").value.to_sat() as i64 - fee as i64;
+        EffectiveUtxo {
+            utxo,
             fee,
             effective_value,
         }
+    }
+
+    /// Get the TxOut of this utxo
+    fn txout(&self) -> bitcoin::TxOut {
+        self.utxo.txout().expect("candidate must have txout")
     }
 }
 
@@ -438,32 +357,32 @@ const BNB_TOTAL_TRIES: usize = 100_000;
 impl<Cs: CoinSelectionAlgorithm> CoinSelectionAlgorithm for BranchAndBoundCoinSelection<Cs> {
     fn coin_select<R: RngCore>(
         &self,
-        required_utxos: Vec<WeightedUtxo>,
-        optional_utxos: Vec<WeightedUtxo>,
+        required_utxos: Vec<CandidateUtxo>,
+        optional_utxos: Vec<CandidateUtxo>,
         fee_rate: FeeRate,
         target_amount: u64,
         drain_script: &Script,
         rand: &mut R,
-    ) -> Result<CoinSelectionResult, InsufficientFunds> {
+    ) -> Result<Selection, InsufficientFunds> {
         // Mapping every (UTXO, usize) to an output group
-        let required_ogs: Vec<OutputGroup> = required_utxos
+        let required_eff: Vec<EffectiveUtxo> = required_utxos
             .iter()
-            .map(|u| OutputGroup::new(u.clone(), fee_rate))
+            .map(|u| EffectiveUtxo::new(u.clone(), fee_rate))
             .collect();
 
         // Mapping every (UTXO, usize) to an output group, filtering UTXOs with a negative
         // effective value
-        let optional_ogs: Vec<OutputGroup> = optional_utxos
+        let optional_eff: Vec<EffectiveUtxo> = optional_utxos
             .iter()
-            .map(|u| OutputGroup::new(u.clone(), fee_rate))
+            .map(|u| EffectiveUtxo::new(u.clone(), fee_rate))
             .filter(|u| u.effective_value.is_positive())
             .collect();
 
-        let curr_value = required_ogs
+        let curr_value = required_eff
             .iter()
             .fold(0, |acc, x| acc + x.effective_value);
 
-        let curr_available_value = optional_ogs
+        let curr_available_value = optional_eff
             .iter()
             .fold(0, |acc, x| acc + x.effective_value);
 
@@ -487,11 +406,11 @@ impl<Cs: CoinSelectionAlgorithm> CoinSelectionAlgorithm for BranchAndBoundCoinSe
             _ => {
                 // Assume we spend all the UTXOs we can (all the required + all the optional with
                 // positive effective value), sum their value and their fee cost.
-                let (utxo_fees, utxo_value) = required_ogs.iter().chain(optional_ogs.iter()).fold(
+                let (utxo_fees, utxo_value) = required_eff.iter().chain(optional_eff.iter()).fold(
                     (0, 0),
                     |(mut fees, mut value), utxo| {
                         fees += utxo.fee;
-                        value += utxo.weighted_utxo.utxo.txout().value.to_sat();
+                        value += utxo.txout().value.to_sat();
 
                         (fees, value)
                     },
@@ -517,12 +436,12 @@ impl<Cs: CoinSelectionAlgorithm> CoinSelectionAlgorithm for BranchAndBoundCoinSe
 
             let excess = decide_change(remaining_amount, fee_rate, drain_script);
 
-            return Ok(calculate_cs_result(vec![], required_ogs, excess));
+            return Ok(calculate_cs_result(vec![], required_eff, excess));
         }
 
         match self.bnb(
-            required_ogs,
-            optional_ogs,
+            required_eff,
+            optional_eff,
             curr_value,
             curr_available_value,
             signed_target_amount,
@@ -549,15 +468,15 @@ impl<Cs> BranchAndBoundCoinSelection<Cs> {
     #[allow(clippy::too_many_arguments)]
     fn bnb(
         &self,
-        required_utxos: Vec<OutputGroup>,
-        mut optional_utxos: Vec<OutputGroup>,
+        required_utxos: Vec<EffectiveUtxo>,
+        mut optional_utxos: Vec<EffectiveUtxo>,
         mut curr_value: i64,
         mut curr_available_value: i64,
         target_amount: i64,
         cost_of_change: u64,
         drain_script: &Script,
         fee_rate: FeeRate,
-    ) -> Result<CoinSelectionResult, BnbError> {
+    ) -> Result<Selection, BnbError> {
         // current_selection[i] will contain true if we are using optional_utxos[i],
         // false otherwise. Note that current_selection.len() could be less than
         // optional_utxos.len(), it just means that we still haven't decided if we should keep
@@ -648,7 +567,7 @@ impl<Cs> BranchAndBoundCoinSelection<Cs> {
             .into_iter()
             .zip(best_selection)
             .filter_map(|(optional, is_in_best)| if is_in_best { Some(optional) } else { None })
-            .collect::<Vec<OutputGroup>>();
+            .collect::<Vec<EffectiveUtxo>>();
 
         let selected_amount = best_selection_value.unwrap();
 
@@ -670,16 +589,16 @@ pub struct SingleRandomDraw;
 impl CoinSelectionAlgorithm for SingleRandomDraw {
     fn coin_select<R: RngCore>(
         &self,
-        required_utxos: Vec<WeightedUtxo>,
-        mut optional_utxos: Vec<WeightedUtxo>,
+        required_utxos: Vec<CandidateUtxo>,
+        mut optional_utxos: Vec<CandidateUtxo>,
         fee_rate: FeeRate,
         target_amount: u64,
         drain_script: &Script,
         rand: &mut R,
-    ) -> Result<CoinSelectionResult, InsufficientFunds> {
+    ) -> Result<Selection, InsufficientFunds> {
         // We put the required UTXOs first and then the randomize optional UTXOs to take as needed
         let utxos = {
-            shuffle_slice(&mut optional_utxos, rand);
+            util::shuffle_slice(&mut optional_utxos, rand);
 
             required_utxos
                 .into_iter()
@@ -693,58 +612,37 @@ impl CoinSelectionAlgorithm for SingleRandomDraw {
 }
 
 fn calculate_cs_result(
-    mut selected_utxos: Vec<OutputGroup>,
-    mut required_utxos: Vec<OutputGroup>,
+    mut selected_utxos: Vec<EffectiveUtxo>,
+    mut required_utxos: Vec<EffectiveUtxo>,
     excess: Excess,
-) -> CoinSelectionResult {
+) -> Selection {
     selected_utxos.append(&mut required_utxos);
     let fee_amount = selected_utxos.iter().map(|u| u.fee).sum::<u64>();
     let selected = selected_utxos
         .into_iter()
-        .map(|u| u.weighted_utxo.utxo)
+        .map(|u| u.utxo)
         .collect::<Vec<_>>();
 
-    CoinSelectionResult {
+    Selection {
         selected,
         fee_amount,
         excess,
     }
 }
 
-/// Remove duplicate UTXOs.
-///
-/// If a UTXO appears in both `required` and `optional`, the appearance in `required` is kept.
-pub(crate) fn filter_duplicates<I>(required: I, optional: I) -> (I, I)
-where
-    I: IntoIterator<Item = WeightedUtxo> + FromIterator<WeightedUtxo>,
-{
-    let mut visited = HashSet::<OutPoint>::new();
-    let required = required
-        .into_iter()
-        .filter(|utxo| visited.insert(utxo.utxo.outpoint()))
-        .collect::<I>();
-    let optional = optional
-        .into_iter()
-        .filter(|utxo| visited.insert(utxo.utxo.outpoint()))
-        .collect::<I>();
-    (required, optional)
-}
-
 #[cfg(test)]
 mod test {
-    use assert_matches::assert_matches;
+    use alloc::boxed::Box;
     use core::str::FromStr;
     use rand::rngs::StdRng;
 
     use bdk_chain::ConfirmationTime;
-    use bitcoin::{Amount, ScriptBuf, TxIn, TxOut};
+    use bitcoin::{psbt, Address, Amount, Network, OutPoint, ScriptBuf, TxIn, TxOut};
 
     use super::*;
-    use crate::types::*;
-    use crate::wallet::coin_selection::filter_duplicates;
 
     use rand::prelude::SliceRandom;
-    use rand::{thread_rng, Rng, RngCore, SeedableRng};
+    use rand::{thread_rng, Rng, SeedableRng};
 
     // signature len (1WU) + signature and sighash (72WU)
     // + pubkey len (1WU) + pubkey (33WU)
@@ -752,30 +650,27 @@ mod test {
 
     const FEE_AMOUNT: u64 = 50;
 
-    fn utxo(value: u64, index: u32, confirmation_time: ConfirmationTime) -> WeightedUtxo {
+    fn utxo(value: u64, index: u32, confirmation_time: ConfirmationTime) -> CandidateUtxo {
         assert!(index < 10);
         let outpoint = OutPoint::from_str(&format!(
             "000000000000000000000000000000000000000000000000000000000000000{}:0",
             index
         ))
         .unwrap();
-        WeightedUtxo {
+        CandidateUtxo {
             satisfaction_weight: Weight::from_wu_usize(P2WPKH_SATISFACTION_SIZE),
-            utxo: Utxo::Local(LocalOutput {
-                outpoint,
-                txout: TxOut {
-                    value: Amount::from_sat(value),
-                    script_pubkey: ScriptBuf::new(),
-                },
-                keychain: KeychainKind::External,
-                is_spent: false,
-                derivation_index: 42,
-                confirmation_time,
+            outpoint,
+            sequence: None,
+            confirmation_time: Some(confirmation_time),
+            txout: Some(TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
             }),
+            psbt_input: Box::new(psbt::Input::default()),
         }
     }
 
-    fn get_test_utxos() -> Vec<WeightedUtxo> {
+    fn get_test_utxos() -> Vec<CandidateUtxo> {
         vec![
             utxo(100_000, 0, ConfirmationTime::Unconfirmed { last_seen: 0 }),
             utxo(
@@ -787,7 +682,7 @@ mod test {
         ]
     }
 
-    fn get_oldest_first_test_utxos() -> Vec<WeightedUtxo> {
+    fn get_oldest_first_test_utxos() -> Vec<CandidateUtxo> {
         // ensure utxos are from different tx
         let utxo1 = utxo(
             120_000,
@@ -816,76 +711,84 @@ mod test {
         vec![utxo1, utxo2, utxo3]
     }
 
-    fn generate_random_utxos(rng: &mut StdRng, utxos_number: usize) -> Vec<WeightedUtxo> {
+    fn generate_random_utxos(rng: &mut StdRng, utxos_number: usize) -> Vec<CandidateUtxo> {
         let mut res = Vec::new();
         for i in 0..utxos_number {
-            res.push(WeightedUtxo {
+            res.push(CandidateUtxo {
                 satisfaction_weight: Weight::from_wu_usize(P2WPKH_SATISFACTION_SIZE),
-                utxo: Utxo::Local(LocalOutput {
-                    outpoint: OutPoint::from_str(&format!(
-                        "ebd9813ecebc57ff8f30797de7c205e3c7498ca950ea4341ee51a685ff2fa30a:{}",
-                        i
-                    ))
-                    .unwrap(),
-                    txout: TxOut {
-                        value: Amount::from_sat(rng.gen_range(0..200000000)),
-                        script_pubkey: ScriptBuf::new(),
-                    },
-                    keychain: KeychainKind::External,
-                    is_spent: false,
-                    derivation_index: rng.next_u32(),
-                    confirmation_time: if rng.gen_bool(0.5) {
-                        ConfirmationTime::Confirmed {
-                            height: rng.next_u32(),
-                            time: rng.next_u64(),
-                        }
-                    } else {
-                        ConfirmationTime::Unconfirmed { last_seen: 0 }
-                    },
+                outpoint: OutPoint::from_str(&format!(
+                    "ebd9813ecebc57ff8f30797de7c205e3c7498ca950ea4341ee51a685ff2fa30a:{}",
+                    i
+                ))
+                .unwrap(),
+                sequence: None,
+                confirmation_time: None,
+                txout: Some(TxOut {
+                    value: Amount::from_sat(rng.gen_range(0..200000000)),
+                    script_pubkey: ScriptBuf::new(),
                 }),
+                psbt_input: Box::new(psbt::Input::default()),
             });
         }
         res
     }
 
-    fn generate_same_value_utxos(utxos_value: u64, utxos_number: usize) -> Vec<WeightedUtxo> {
+    fn generate_same_value_utxos(utxos_value: u64, utxos_number: usize) -> Vec<CandidateUtxo> {
         (0..utxos_number)
-            .map(|i| WeightedUtxo {
+            .map(|i| CandidateUtxo {
                 satisfaction_weight: Weight::from_wu_usize(P2WPKH_SATISFACTION_SIZE),
-                utxo: Utxo::Local(LocalOutput {
-                    outpoint: OutPoint::from_str(&format!(
-                        "ebd9813ecebc57ff8f30797de7c205e3c7498ca950ea4341ee51a685ff2fa30a:{}",
-                        i
-                    ))
-                    .unwrap(),
-                    txout: TxOut {
-                        value: Amount::from_sat(utxos_value),
-                        script_pubkey: ScriptBuf::new(),
-                    },
-                    keychain: KeychainKind::External,
-                    is_spent: false,
-                    derivation_index: 42,
-                    confirmation_time: ConfirmationTime::Unconfirmed { last_seen: 0 },
+                outpoint: OutPoint::from_str(&format!(
+                    "ebd9813ecebc57ff8f30797de7c205e3c7498ca950ea4341ee51a685ff2fa30a:{}",
+                    i
+                ))
+                .unwrap(),
+                sequence: None,
+                confirmation_time: None,
+                txout: Some(TxOut {
+                    value: Amount::from_sat(utxos_value),
+                    script_pubkey: ScriptBuf::new(),
                 }),
+                psbt_input: Box::new(psbt::Input::default()),
             })
             .collect()
     }
 
-    fn sum_random_utxos(mut rng: &mut StdRng, utxos: &mut Vec<WeightedUtxo>) -> u64 {
+    fn sum_random_utxos(mut rng: &mut StdRng, utxos: &mut Vec<CandidateUtxo>) -> u64 {
         let utxos_picked_len = rng.gen_range(2..utxos.len() / 2);
         utxos.shuffle(&mut rng);
         utxos[..utxos_picked_len]
             .iter()
-            .map(|u| u.utxo.txout().value.to_sat())
+            .map(|u| u.txout().unwrap().value.to_sat())
             .sum()
     }
 
-    fn calc_target_amount(utxos: &[WeightedUtxo], fee_rate: FeeRate) -> u64 {
+    fn calc_target_amount(utxos: &[CandidateUtxo], fee_rate: FeeRate) -> u64 {
         utxos
             .iter()
             .cloned()
-            .map(|utxo| u64::try_from(OutputGroup::new(utxo, fee_rate).effective_value).unwrap())
+            .map(|utxo| u64::try_from(EffectiveUtxo::new(utxo, fee_rate).effective_value).unwrap())
             .sum()
+    }
+
+    #[test]
+    fn test_is_dust() {
+        let script_p2pkh = Address::from_str("1GNgwA8JfG7Kc8akJ8opdNWJUihqUztfPe")
+            .unwrap()
+            .require_network(Network::Bitcoin)
+            .unwrap()
+            .script_pubkey();
+        assert!(script_p2pkh.is_p2pkh());
+        assert!(545.is_dust(&script_p2pkh));
+        assert!(!546.is_dust(&script_p2pkh));
+
+        let script_p2wpkh = Address::from_str("bc1qxlh2mnc0yqwas76gqq665qkggee5m98t8yskd8")
+            .unwrap()
+            .require_network(Network::Bitcoin)
+            .unwrap()
+            .script_pubkey();
+        assert!(script_p2wpkh.is_p2wpkh());
+        assert!(293.is_dust(&script_p2wpkh));
+        assert!(!294.is_dust(&script_p2wpkh));
     }
 
     #[test]
@@ -1077,7 +980,7 @@ mod test {
 
         let target_amount: u64 = utxos
             .iter()
-            .map(|wu| wu.utxo.txout().value.to_sat())
+            .map(|utxo| utxo.txout().unwrap().value.to_sat())
             .sum::<u64>()
             - 50;
         let drain_script = ScriptBuf::default();
@@ -1181,12 +1084,10 @@ mod test {
             &mut thread_rng(),
         );
 
-        assert!(
-            matches!(result, Ok(CoinSelectionResult {selected, fee_amount, ..})
-                if selected.iter().map(|u| u.txout().value.to_sat()).sum::<u64>() > target_amount
-                && fee_amount == ((selected.len() * 68) as u64)
-            )
-        );
+        assert!(matches!(result, Ok(Selection { selected, fee_amount, .. })
+            if selected.iter().map(|u| u.txout().unwrap().value.to_sat()).sum::<u64>() > target_amount
+            && fee_amount == ((selected.len() * 68) as u64)
+        ));
     }
 
     #[test]
@@ -1226,9 +1127,15 @@ mod test {
         ));
 
         // Defensive assertions, for sanity and in case someone changes the test utxos vector.
-        let amount: u64 = required.iter().map(|u| u.utxo.txout().value.to_sat()).sum();
+        let amount: u64 = required
+            .iter()
+            .map(|u| u.txout().unwrap().value.to_sat())
+            .sum();
         assert_eq!(amount, 100_000);
-        let amount: u64 = optional.iter().map(|u| u.utxo.txout().value.to_sat()).sum();
+        let amount: u64 = optional
+            .iter()
+            .map(|u| u.txout().unwrap().value.to_sat())
+            .sum();
         assert!(amount > 150_000);
         let drain_script = ScriptBuf::default();
 
@@ -1341,9 +1248,9 @@ mod test {
     #[test]
     fn test_bnb_function_no_exact_match() {
         let fee_rate = FeeRate::from_sat_per_vb_unchecked(10);
-        let utxos: Vec<OutputGroup> = get_test_utxos()
+        let utxos: Vec<EffectiveUtxo> = get_test_utxos()
             .into_iter()
-            .map(|u| OutputGroup::new(u, fee_rate))
+            .map(|u| EffectiveUtxo::new(u, fee_rate))
             .collect();
 
         let curr_available_value = utxos.iter().fold(0, |acc, x| acc + x.effective_value);
@@ -1369,9 +1276,9 @@ mod test {
     #[test]
     fn test_bnb_function_tries_exceeded() {
         let fee_rate = FeeRate::from_sat_per_vb_unchecked(10);
-        let utxos: Vec<OutputGroup> = generate_same_value_utxos(100_000, 100_000)
+        let utxos: Vec<EffectiveUtxo> = generate_same_value_utxos(100_000, 100_000)
             .into_iter()
-            .map(|u| OutputGroup::new(u, fee_rate))
+            .map(|u| EffectiveUtxo::new(u, fee_rate))
             .collect();
 
         let curr_available_value = utxos.iter().fold(0, |acc, x| acc + x.effective_value);
@@ -1404,7 +1311,7 @@ mod test {
 
         let utxos: Vec<_> = generate_same_value_utxos(50_000, 10)
             .into_iter()
-            .map(|u| OutputGroup::new(u, fee_rate))
+            .map(|u| EffectiveUtxo::new(u, fee_rate))
             .collect();
 
         let curr_value = 0;
@@ -1443,7 +1350,7 @@ mod test {
         for _ in 0..200 {
             let optional_utxos: Vec<_> = generate_random_utxos(&mut rng, 40)
                 .into_iter()
-                .map(|u| OutputGroup::new(u, fee_rate))
+                .map(|u| EffectiveUtxo::new(u, fee_rate))
                 .collect();
 
             let curr_value = 0;
@@ -1487,13 +1394,13 @@ mod test {
             &mut thread_rng(),
         );
 
-        assert_matches!(
+        assert!(matches!(
             selection,
             Err(InsufficientFunds {
                 available: 300_000,
                 ..
             })
-        );
+        ));
     }
 
     #[test]
@@ -1502,7 +1409,7 @@ mod test {
         let drain_script = ScriptBuf::default();
 
         let (required, optional) = utxos.into_iter().partition(
-            |u| matches!(u, WeightedUtxo { utxo, .. } if utxo.txout().value.to_sat() < 1000),
+            |u| matches!(u, CandidateUtxo { txout: Some(txout), .. } if txout.value.to_sat() < 1000),
         );
 
         let selection = BranchAndBoundCoinSelection::<SingleRandomDraw>::default().coin_select(
@@ -1514,13 +1421,13 @@ mod test {
             &mut thread_rng(),
         );
 
-        assert_matches!(
+        assert!(matches!(
             selection,
             Err(InsufficientFunds {
                 available: 300_010,
                 ..
             })
-        );
+        ));
     }
 
     #[test]
@@ -1537,13 +1444,13 @@ mod test {
             &mut thread_rng(),
         );
 
-        assert_matches!(
+        assert!(matches!(
             selection,
             Err(InsufficientFunds {
                 available: 300_010,
                 ..
             })
-        );
+        ));
     }
 
     #[test]
@@ -1568,96 +1475,6 @@ mod test {
             )
             .unwrap();
         assert_eq!(res.selected_amount(), 200_000);
-    }
-
-    #[test]
-    fn test_filter_duplicates() {
-        fn utxo(txid: &str, value: u64) -> WeightedUtxo {
-            WeightedUtxo {
-                satisfaction_weight: Weight::ZERO,
-                utxo: Utxo::Local(LocalOutput {
-                    outpoint: OutPoint::new(bitcoin::hashes::Hash::hash(txid.as_bytes()), 0),
-                    txout: TxOut {
-                        value: Amount::from_sat(value),
-                        script_pubkey: ScriptBuf::new(),
-                    },
-                    keychain: KeychainKind::External,
-                    is_spent: false,
-                    derivation_index: 0,
-                    confirmation_time: ConfirmationTime::Confirmed {
-                        height: 12345,
-                        time: 12345,
-                    },
-                }),
-            }
-        }
-
-        fn to_utxo_vec(utxos: &[(&str, u64)]) -> Vec<WeightedUtxo> {
-            let mut v = utxos
-                .iter()
-                .map(|&(txid, value)| utxo(txid, value))
-                .collect::<Vec<_>>();
-            v.sort_by_key(|u| u.utxo.outpoint());
-            v
-        }
-
-        struct TestCase<'a> {
-            name: &'a str,
-            required: &'a [(&'a str, u64)],
-            optional: &'a [(&'a str, u64)],
-            exp_required: &'a [(&'a str, u64)],
-            exp_optional: &'a [(&'a str, u64)],
-        }
-
-        let test_cases = [
-            TestCase {
-                name: "no_duplicates",
-                required: &[("A", 1000), ("B", 2100)],
-                optional: &[("C", 1000)],
-                exp_required: &[("A", 1000), ("B", 2100)],
-                exp_optional: &[("C", 1000)],
-            },
-            TestCase {
-                name: "duplicate_required_utxos",
-                required: &[("A", 3000), ("B", 1200), ("C", 1234), ("A", 3000)],
-                optional: &[("D", 2100)],
-                exp_required: &[("A", 3000), ("B", 1200), ("C", 1234)],
-                exp_optional: &[("D", 2100)],
-            },
-            TestCase {
-                name: "duplicate_optional_utxos",
-                required: &[("A", 3000), ("B", 1200)],
-                optional: &[("C", 5000), ("D", 1300), ("C", 5000)],
-                exp_required: &[("A", 3000), ("B", 1200)],
-                exp_optional: &[("C", 5000), ("D", 1300)],
-            },
-            TestCase {
-                name: "duplicate_across_required_and_optional_utxos",
-                required: &[("A", 3000), ("B", 1200), ("C", 2100)],
-                optional: &[("A", 3000), ("D", 1200), ("E", 5000)],
-                exp_required: &[("A", 3000), ("B", 1200), ("C", 2100)],
-                exp_optional: &[("D", 1200), ("E", 5000)],
-            },
-        ];
-
-        for (i, t) in test_cases.into_iter().enumerate() {
-            let (required, optional) =
-                filter_duplicates(to_utxo_vec(t.required), to_utxo_vec(t.optional));
-            assert_eq!(
-                required,
-                to_utxo_vec(t.exp_required),
-                "[{}:{}] unexpected `required` result",
-                i,
-                t.name
-            );
-            assert_eq!(
-                optional,
-                to_utxo_vec(t.exp_optional),
-                "[{}:{}] unexpected `optional` result",
-                i,
-                t.name
-            );
-        }
     }
 
     #[test]
@@ -1751,7 +1568,7 @@ mod test {
             let vouts = result
                 .selected
                 .iter()
-                .map(|utxo| utxo.outpoint().vout)
+                .map(|utxo| utxo.outpoint.vout)
                 .collect::<Vec<u32>>();
             assert_eq!(vouts, tc.exp_vouts, "wrong selected vouts for {}", tc.name);
         }

@@ -17,13 +17,14 @@
 //! # use std::str::FromStr;
 //! # use bitcoin::*;
 //! # use bdk_wallet::*;
+//! # use bdk_wallet::doctest_wallet;
 //! # use bdk_wallet::ChangeSet;
 //! # use bdk_wallet::error::CreateTxError;
 //! # use anyhow::Error;
 //! # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap().assume_checked();
 //! # let mut wallet = doctest_wallet!();
 //! // create a TxBuilder from a wallet
-//! let mut tx_builder = wallet.build_tx();
+//! let mut tx_builder = wallet.tx_builder();
 //!
 //! tx_builder
 //!     // Create a transaction with one output to `to_address` of 50_000 satoshi
@@ -32,42 +33,44 @@
 //!     .fee_rate(FeeRate::from_sat_per_vb(5).expect("valid feerate"))
 //!     // Only spend non-change outputs
 //!     .do_not_spend_change();
-//! let psbt = tx_builder.finish()?;
+//! let psbt = tx_builder.build_tx()?;
 //! # Ok::<(), anyhow::Error>(())
 //! ```
-
-use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
+use alloc::boxed::Box;
+use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::fmt;
+use core::mem;
 
-use alloc::sync::Arc;
-
-use bitcoin::psbt::{self, Psbt};
-use bitcoin::script::PushBytes;
-use bitcoin::{
-    absolute, Amount, FeeRate, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
-    Weight,
+use bdk_chain::bitcoin::{
+    absolute, psbt, script::PushBytes, transaction::Version, Amount, FeeRate, OutPoint, Psbt,
+    ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Weight,
 };
+use bdk_chain::collections::{BTreeMap, HashSet};
+use bdk_chain::miniscript::plan::Assets;
+use bdk_chain::ConfirmationTime;
 use rand_core::RngCore;
 
-use super::coin_selection::CoinSelectionAlgorithm;
-use super::utils::shuffle_slice;
-use super::{CreateTxError, Wallet};
-use crate::collections::{BTreeMap, HashSet};
-use crate::{KeychainKind, LocalOutput, Utxo, WeightedUtxo};
+use crate::coin_selection::CoinSelectionAlgorithm;
+use crate::util;
+use crate::CreateTx;
+// use crate::coin_selection::CoinSelectionAlgorithm;
 
 /// A transaction builder
 ///
-/// A `TxBuilder` is created by calling [`build_tx`] or [`build_fee_bump`] on a wallet. After
-/// assigning it, you set options on it until finally calling [`finish`] to consume the builder and
-/// generate the transaction.
+/// A `TxBuilder` is created by calling [`new`](TxBuilder::new). After initializing the builder,
+/// you set options on it until finally calling `build_tx` to consume the builder and generate
+/// the transaction.
 ///
 /// Each option setting method on `TxBuilder` takes and returns `&mut self` so you can chain calls
 /// as in the following example:
 ///
-/// ```
+/// ```rust,no_run
 /// # use bdk_wallet::*;
-/// # use bdk_wallet::tx_builder::*;
+/// # use bdk_transaction::TxOrdering;
 /// # use bitcoin::*;
 /// # use core::str::FromStr;
 /// # use bdk_wallet::ChangeSet;
@@ -78,55 +81,50 @@ use crate::{KeychainKind, LocalOutput, Utxo, WeightedUtxo};
 /// # let addr2 = addr1.clone();
 /// // chaining
 /// let psbt1 = {
-///     let mut builder = wallet.build_tx();
+///     let mut builder = wallet.tx_builder();
 ///     builder
 ///         .ordering(TxOrdering::Untouched)
 ///         .add_recipient(addr1.script_pubkey(), Amount::from_sat(50_000))
-///         .add_recipient(addr2.script_pubkey(), Amount::from_sat(50_000));
-///     builder.finish()?
+///         .add_recipient(addr2.script_pubkey(), Amount::from_sat(50_000))
+///         .build_tx()?
 /// };
 ///
 /// // non-chaining
 /// let psbt2 = {
-///     let mut builder = wallet.build_tx();
+///     let mut builder = wallet.tx_builder();
 ///     builder.ordering(TxOrdering::Untouched);
 ///     for addr in &[addr1, addr2] {
 ///         builder.add_recipient(addr.script_pubkey(), Amount::from_sat(50_000));
 ///     }
-///     builder.finish()?
+///     builder.build_tx()?
 /// };
 ///
 /// assert_eq!(psbt1.unsigned_tx.output[..2], psbt2.unsigned_tx.output[..2]);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-///
-/// At the moment [`coin_selection`] is an exception to the rule as it consumes `self`.
-/// This means it is usually best to call [`coin_selection`] on the return value of `build_tx` before assigning it.
-///
-/// For further examples see [this module](super::tx_builder)'s documentation;
-///
-/// [`build_tx`]: Wallet::build_tx
-/// [`build_fee_bump`]: Wallet::build_fee_bump
-/// [`finish`]: Self::finish
-/// [`coin_selection`]: Self::coin_selection
 #[derive(Debug)]
-pub struct TxBuilder<'a, Cs> {
-    pub(crate) wallet: Rc<RefCell<&'a mut Wallet>>,
+pub struct TxBuilder<'a, Cs, T> {
+    /// Tx params
     pub(crate) params: TxParams,
+    /// Coin selection algorithm
     pub(crate) coin_selection: Cs,
+    /// Transaction creator
+    pub(crate) creator: Rc<RefCell<&'a mut T>>,
 }
 
 /// The parameters for transaction creation sans coin selection algorithm.
 //TODO: TxParams should eventually be exposed publicly.
-#[derive(Default, Debug, Clone)]
-pub(crate) struct TxParams {
+#[derive(Default, Debug)]
+pub struct TxParams {
+    pub(crate) assets: Assets,
     pub(crate) recipients: Vec<(ScriptBuf, Amount)>,
     pub(crate) drain_wallet: bool,
     pub(crate) drain_to: Option<ScriptBuf>,
     pub(crate) fee_policy: Option<FeePolicy>,
     pub(crate) internal_policy_path: Option<BTreeMap<String, Vec<usize>>>,
     pub(crate) external_policy_path: Option<BTreeMap<String, Vec<usize>>>,
-    pub(crate) utxos: Vec<WeightedUtxo>,
+    pub(crate) utxos: HashSet<OutPoint>, // candidates that can be looked up by outpoint
+    pub(crate) candidates: HashSet<CandidateUtxo>, // foreign utxos
     pub(crate) unspendable: HashSet<OutPoint>,
     pub(crate) manually_selected_only: bool,
     pub(crate) sighash: Option<psbt::PsbtSighashType>,
@@ -143,15 +141,84 @@ pub(crate) struct TxParams {
     pub(crate) allow_dust: bool,
 }
 
+/// A UTXO with its satisfaction weight. This is used primarily when
+/// adding foreign UTXOs to a [`TxBuilder`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CandidateUtxo {
+    /// Outpoint
+    pub outpoint: OutPoint,
+    /// Satisfaction weight
+    pub satisfaction_weight: Weight,
+    /// TxOut (may be None if this is a foreign utxo)
+    pub txout: Option<TxOut>,
+    /// Sequence
+    pub sequence: Option<Sequence>,
+    /// Confirmation time
+    pub confirmation_time: Option<ConfirmationTime>,
+    /// Psbt input
+    pub psbt_input: Box<psbt::Input>,
+}
+
+impl Default for CandidateUtxo {
+    fn default() -> Self {
+        Self {
+            outpoint: OutPoint::null(),
+            satisfaction_weight: Weight::ZERO,
+            sequence: None,
+            confirmation_time: None,
+            txout: None,
+            psbt_input: Box::new(psbt::Input::default()),
+        }
+    }
+}
+
+impl PartialOrd for CandidateUtxo {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CandidateUtxo {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.partial_cmp(other).expect("OutPoint is Ord")
+    }
+}
+
+impl CandidateUtxo {
+    /// Get the TxOut from this candidate.
+    pub fn txout(&self) -> Option<TxOut> {
+        if self.txout.is_some() {
+            return self.txout.clone();
+        }
+
+        let witness_utxo = &self.psbt_input.witness_utxo;
+        let non_witness_utxo = &self.psbt_input.non_witness_utxo;
+
+        match (witness_utxo, non_witness_utxo) {
+            (Some(_), _) => witness_utxo.clone(),
+            (_, Some(_)) => non_witness_utxo
+                .as_ref()
+                .map(|tx| tx.output[self.outpoint.vout as usize].clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Previous fee.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PreviousFee {
+pub struct PreviousFee {
+    /// Absolute
     pub absolute: Amount,
+    /// FeeRate
     pub rate: FeeRate,
 }
 
+/// Fee policy.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum FeePolicy {
+pub enum FeePolicy {
+    /// FeeRate
     FeeRate(FeeRate),
+    /// Amount
     FeeAmount(Amount),
 }
 
@@ -161,18 +228,121 @@ impl Default for FeePolicy {
     }
 }
 
-impl<'a, Cs: Clone> Clone for TxBuilder<'a, Cs> {
-    fn clone(&self) -> Self {
-        TxBuilder {
-            wallet: self.wallet.clone(),
-            params: self.params.clone(),
-            coin_selection: self.coin_selection.clone(),
+macro_rules! impl_get_field_clone {
+    ($($field:ident, $ret:ty,)*) => {
+        paste::paste! {
+            $(
+                impl TxParams {
+                    #[doc = "Get `" $field "` parameter"]
+                    pub fn $field(&self) -> $ret {
+                        self.$field.clone()
+                    }
+                }
+            )*
+        }
+    }
+}
+macro_rules! impl_get_field {
+    ($($field:ident, $ret:ty,)*) => {
+        paste::paste! {
+            $(
+                impl TxParams {
+                    #[doc = "Get `" $field "` parameter"]
+                    pub fn $field(&self) -> $ret {
+                        self.$field
+                    }
+                }
+            )*
+        }
+    }
+}
+#[rustfmt::skip]
+impl_get_field_clone!(
+    recipients, Vec<(ScriptBuf, Amount)>,
+    drain_to, Option<ScriptBuf>,
+    fee_policy, Option<FeePolicy>,
+    internal_policy_path, Option<BTreeMap<String, Vec<usize>>>,
+    external_policy_path, Option<BTreeMap<String, Vec<usize>>>,
+    utxos, HashSet<OutPoint>,
+    candidates, HashSet<CandidateUtxo>,
+    unspendable, HashSet<OutPoint>,
+    sighash, Option<psbt::PsbtSighashType>,
+    ordering, TxOrdering,
+    locktime, Option<absolute::LockTime>,
+    sequence, Option<Sequence>,
+    version, Option<Version>,
+    change_policy, ChangeSpendPolicy,
+    bumping_fee, Option<PreviousFee>,
+    current_height, Option<absolute::LockTime>,
+);
+#[rustfmt::skip]
+impl_get_field!(
+    drain_wallet, bool,
+    manually_selected_only, bool,
+    only_witness_utxo, bool,
+    add_global_xpubs, bool,
+    include_output_redeem_witness_script, bool,
+    allow_dust, bool,
+);
+
+/// Implemented on [`Assets`] so that one instance can be extended from a reference
+/// of the same type.
+// TODO: try upstream some form of this to rust-miniscript
+pub trait AssetsExt {
+    /// Extend `self` with the contents of `other`.
+    fn extend(&mut self, other: &Self);
+}
+
+impl AssetsExt for Assets {
+    fn extend(&mut self, other: &Self) {
+        self.keys.extend(other.keys.clone());
+        self.sha256_preimages.extend(other.sha256_preimages.clone());
+        self.hash256_preimages
+            .extend(other.hash256_preimages.clone());
+        self.ripemd160_preimages
+            .extend(other.ripemd160_preimages.clone());
+        self.hash160_preimages
+            .extend(other.hash160_preimages.clone());
+
+        // note: should this look for the higher of the two values?
+        self.relative_timelock = other.relative_timelock.or(self.relative_timelock);
+        self.absolute_timelock = other.absolute_timelock.or(self.absolute_timelock);
+    }
+}
+
+impl<'a, Cs: CoinSelectionAlgorithm, T> TxBuilder<'a, Cs, T> {
+    /// New from selector and tx creator.
+    pub fn new(coin_selection: Cs, creator: &'a mut T) -> Self {
+        Self {
+            params: TxParams::default(),
+            coin_selection,
+            creator: Rc::new(RefCell::new(creator)),
         }
     }
 }
 
-// Methods supported for any CoinSelectionAlgorithm.
-impl<'a, Cs> TxBuilder<'a, Cs> {
+impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
+    /// Set candidate utxos.
+    pub fn set_candidates(
+        &mut self,
+        candidates: impl IntoIterator<Item = CandidateUtxo>,
+    ) -> &mut Self {
+        self.params.candidates.extend(candidates);
+        self
+    }
+
+    /// Set previous fee.
+    pub fn set_previous_fee(&mut self, previous_fee: PreviousFee) -> &mut Self {
+        self.params.bumping_fee = Some(previous_fee);
+        self
+    }
+
+    /// Add [`Assets`].
+    pub fn add_assets(&mut self, assets: &Assets) -> &mut Self {
+        self.params.assets.extend(assets);
+        self
+    }
+
     /// Set a custom fee rate.
     ///
     /// This method sets the mining fee paid by the transaction as a rate on its size.
@@ -204,10 +374,9 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
 
     /// Set the policy path to use while creating the transaction for a given keychain.
     ///
-    /// This method accepts a map where the key is the policy node id (see
-    /// [`Policy::id`](crate::descriptor::Policy::id)) and the value is the list of the indexes of
-    /// the items that are intended to be satisfied from the policy node (see
-    /// [`SatisfiableItem::Thresh::items`](crate::descriptor::policy::SatisfiableItem::Thresh::items)).
+    /// This method accepts a map where the key is the policy node id and the value
+    /// is the list of the indexes of the items that are intended to be satisfied from
+    /// the policy node (see the [policy module][0] for details).
     ///
     /// ## Example
     ///
@@ -230,11 +399,10 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     ///   in order to spend an `OP_CLTV` branch.
     /// * If fragments `2` and `3` are used, the transaction will need both.
     ///
-    /// When the spending policy is represented as a tree (see
-    /// [`Wallet::policies`](super::Wallet::policies)), every node
-    /// is assigned a unique identifier that can be used in the policy path to specify which of
-    /// the node's children the user intends to satisfy: for instance, assuming the `thresh()`
-    /// root node of this example has an id of `aabbccdd`, the policy path map would look like:
+    /// When the spending policy is represented as a tree, every node is assigned a
+    /// unique identifier that can be used in the policy path to specify which of the node's
+    /// children the user intends to satisfy: for instance, assuming the `thresh()` root
+    /// node of this example has an id of `aabbccdd`, the policy path map would look like:
     ///
     /// `{ "aabbccdd" => [0, 1] }`
     ///
@@ -258,23 +426,23 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// path.insert("aabbccdd".to_string(), vec![0, 1]);
     ///
     /// let builder = wallet
-    ///     .build_tx()
+    ///     .tx_builder()
     ///     .add_recipient(to_address.script_pubkey(), Amount::from_sat(50_000))
-    ///     .policy_path(path, KeychainKind::External);
+    ///     .external_policy_path(path);
     ///
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn policy_path(
-        &mut self,
-        policy_path: BTreeMap<String, Vec<usize>>,
-        keychain: KeychainKind,
-    ) -> &mut Self {
-        let to_update = match keychain {
-            KeychainKind::Internal => &mut self.params.internal_policy_path,
-            KeychainKind::External => &mut self.params.external_policy_path,
-        };
+    /// [0]: https://docs.rs/bdk_wallet/latest/bdk_wallet/descriptor/policy/index.html
+    pub fn external_policy_path(&mut self, policy_path: BTreeMap<String, Vec<usize>>) -> &mut Self {
+        self.params.external_policy_path = Some(policy_path);
+        self
+    }
 
-        *to_update = Some(policy_path);
+    /// Set the internal policy path to use while creating the transaction.
+    ///
+    /// See also [`external_policy_path`](Self::external_policy_path).
+    pub fn internal_policy_path(&mut self, policy_path: BTreeMap<String, Vec<usize>>) -> &mut Self {
+        self.params.internal_policy_path = Some(policy_path);
         self
     }
 
@@ -285,27 +453,7 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// These have priority over the "unspendable" utxos, meaning that if a utxo is present both in
     /// the "utxos" and the "unspendable" list, it will be spent.
     pub fn add_utxos(&mut self, outpoints: &[OutPoint]) -> Result<&mut Self, AddUtxoError> {
-        {
-            let wallet = self.wallet.borrow();
-            let utxos = outpoints
-                .iter()
-                .map(|outpoint| {
-                    wallet
-                        .get_utxo(*outpoint)
-                        .ok_or(AddUtxoError::UnknownUtxo(*outpoint))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            for utxo in utxos {
-                let descriptor = wallet.public_descriptor(utxo.keychain);
-                let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
-                self.params.utxos.push(WeightedUtxo {
-                    satisfaction_weight,
-                    utxo: Utxo::Local(utxo),
-                });
-            }
-        }
-
+        self.params.utxos.extend(outpoints);
         Ok(self)
     }
 
@@ -347,7 +495,7 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     ///
     /// In order to use [`Wallet::calculate_fee`] or [`Wallet::calculate_fee_rate`] for a transaction
     /// created with foreign UTXO(s) you must manually insert the corresponding TxOut(s) into the tx
-    /// graph using the [`Wallet::insert_txout`] function.
+    /// graph using the `Wallet::insert_txout` function.
     ///
     /// # Errors
     ///
@@ -357,12 +505,13 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// 2. The data in `non_witness_utxo` does not match what is in `outpoint`.
     ///
     /// Note unless you set [`only_witness_utxo`] any non-taproot `psbt_input` you pass to this
-    /// method must have `non_witness_utxo` set otherwise you will get an error when [`finish`]
+    /// method must have `non_witness_utxo` set otherwise you will get an error when `build_tx`
     /// is called.
     ///
     /// [`only_witness_utxo`]: Self::only_witness_utxo
-    /// [`finish`]: Self::finish
-    /// [`max_weight_to_satisfy`]: miniscript::Descriptor::max_weight_to_satisfy
+    /// [`max_weight_to_satisfy`]: bdk_chain::miniscript::Descriptor::max_weight_to_satisfy
+    /// [`Wallet::calculate_fee`]: https://docs.rs/bdk_wallet/latest/bdk_wallet/struct.Wallet.html#method.calculate_fee
+    /// [`Wallet::calculate_fee_rate`]: https://docs.rs/bdk_wallet/latest/bdk_wallet/struct.Wallet.html#method.calculate_fee_rate
     pub fn add_foreign_utxo(
         &mut self,
         outpoint: OutPoint,
@@ -404,13 +553,13 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
             }
         }
 
-        self.params.utxos.push(WeightedUtxo {
+        self.params.candidates.insert(CandidateUtxo {
             satisfaction_weight,
-            utxo: Utxo::Foreign {
-                outpoint,
-                sequence: Some(sequence),
-                psbt_input: Box::new(psbt_input),
-            },
+            outpoint,
+            sequence: Some(sequence),
+            confirmation_time: None,
+            txout: None,
+            psbt_input: Box::new(psbt_input),
         });
 
         Ok(self)
@@ -504,20 +653,24 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
         self
     }
 
-    /// Only Fill-in the [`psbt::Input::witness_utxo`](bitcoin::psbt::Input::witness_utxo) field when spending from
-    /// SegWit descriptors.
+    /// Only Fill-in the [`psbt::Input::witness_utxo`] field when spending from SegWit descriptors.
     ///
     /// This reduces the size of the PSBT, but some signers might reject them due to the lack of
     /// the `non_witness_utxo`.
+    ///
+    /// [`psbt::Input::witness_utxo`]: bdk_chain::bitcoin::psbt::Input::witness_utxo
     pub fn only_witness_utxo(&mut self) -> &mut Self {
         self.params.only_witness_utxo = true;
         self
     }
 
-    /// Fill-in the [`psbt::Output::redeem_script`](bitcoin::psbt::Output::redeem_script) and
-    /// [`psbt::Output::witness_script`](bitcoin::psbt::Output::witness_script) fields.
+    /// Fill-in the [`psbt::Output::redeem_script`][0] and [`psbt::Output::witness_script`][1]
+    /// fields.
     ///
     /// This is useful for signers which always require it, like ColdCard hardware wallets.
+    ///
+    /// [0]: bdk_chain::bitcoin::psbt::Output::redeem_script
+    /// [1]: bdk_chain::bitcoin::psbt::Output::witness_script
     pub fn include_output_redeem_witness_script(&mut self) -> &mut Self {
         self.params.include_output_redeem_witness_script = true;
         self
@@ -543,12 +696,16 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     ///
     /// Overrides the [`CoinSelectionAlgorithm`].
     ///
-    /// Note that this function consumes the builder and returns it so it is usually best to put this as the first call on the builder.
-    pub fn coin_selection<P: CoinSelectionAlgorithm>(self, coin_selection: P) -> TxBuilder<'a, P> {
+    /// Note that this function consumes the builder and returns it so it is usually best to put
+    /// this as the first call on the builder.
+    pub fn coin_selection<A: CoinSelectionAlgorithm>(
+        self,
+        coin_selection: A,
+    ) -> TxBuilder<'a, A, T> {
         TxBuilder {
-            wallet: self.wallet,
             params: self.params,
             coin_selection,
+            creator: self.creator,
         }
     }
 
@@ -556,8 +713,8 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     ///
     /// This can cause conflicts if the wallet's descriptors contain an
     /// "older" (OP_CSV) operator and the given `nsequence` is lower than the CSV value.
-    pub fn set_exact_sequence(&mut self, n_sequence: Sequence) -> &mut Self {
-        self.params.sequence = Some(n_sequence);
+    pub fn set_exact_sequence(&mut self, nsequence: Sequence) -> &mut Self {
+        self.params.sequence = Some(nsequence);
         self
     }
 
@@ -599,7 +756,7 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     }
 
     /// Add data as an output, using OP_RETURN
-    pub fn add_data<T: AsRef<PushBytes>>(&mut self, data: &T) -> &mut Self {
+    pub fn add_data<B: AsRef<PushBytes>>(&mut self, data: &B) -> &mut Self {
         let script = ScriptBuf::new_op_return(data);
         self.add_recipient(script, Amount::ZERO);
         self
@@ -634,64 +791,48 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     ///     .unwrap()
     ///     .assume_checked();
     /// # let mut wallet = doctest_wallet!();
-    /// let mut tx_builder = wallet.build_tx();
+    /// let mut tx_builder = wallet.tx_builder();
     ///
     /// tx_builder
     ///     // Spend all outputs in this wallet.
     ///     .drain_wallet()
     ///     // Send the excess (which is all the coins minus the fee) to this address.
-    ///     .drain_to(to_address.script_pubkey())
+    ///     .set_drain_to(to_address.script_pubkey())
     ///     .fee_rate(FeeRate::from_sat_per_vb(5).expect("valid feerate"));
-    /// let psbt = tx_builder.finish()?;
+    /// let psbt = tx_builder.build_tx()?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     ///
     /// [`add_recipient`]: Self::add_recipient
     /// [`add_utxos`]: Self::add_utxos
     /// [`drain_wallet`]: Self::drain_wallet
-    pub fn drain_to(&mut self, script_pubkey: ScriptBuf) -> &mut Self {
+    pub fn set_drain_to(&mut self, script_pubkey: ScriptBuf) -> &mut Self {
         self.params.drain_to = Some(script_pubkey);
         self
     }
 }
 
-impl<'a, Cs: CoinSelectionAlgorithm> TxBuilder<'a, Cs> {
+impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
     /// Finish building the transaction.
     ///
-    /// Uses the thread-local random number generator (rng).
-    ///
-    /// Returns a new [`Psbt`] per [`BIP174`].
-    ///
-    /// [`BIP174`]: https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
-    ///
-    /// **WARNING**: To avoid change address reuse you must persist the changes resulting from one
-    /// or more calls to this method before closing the wallet. See [`Wallet::reveal_next_address`].
-    #[cfg(feature = "std")]
-    pub fn finish(self) -> Result<Psbt, CreateTxError> {
-        self.finish_with_aux_rand(&mut bitcoin::key::rand::thread_rng())
-    }
-
-    /// Finish building the transaction.
-    ///
-    /// Uses a provided random number generator (rng).
-    ///
-    /// Returns a new [`Psbt`] per [`BIP174`].
-    ///
-    /// [`BIP174`]: https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
-    ///
-    /// **WARNING**: To avoid change address reuse you must persist the changes resulting from one
-    /// or more calls to this method before closing the wallet. See [`Wallet::reveal_next_address`].
-    pub fn finish_with_aux_rand(self, rng: &mut impl RngCore) -> Result<Psbt, CreateTxError> {
-        self.wallet
+    /// The provided random number generator `rng` can be used to shuffle inputs and outputs
+    /// as well as for some coin selection algorithms such as single random draw.
+    pub fn build_tx_with_aux_rand(&mut self, rng: &mut impl RngCore) -> Result<Psbt, T::Error>
+    where
+        Cs: CoinSelectionAlgorithm,
+        T: CreateTx,
+    {
+        let params = mem::take(&mut self.params);
+        self.creator
             .borrow_mut()
-            .create_tx(self.coin_selection, self.params, rng)
+            .create_tx(params, self.coin_selection.clone(), rng)
     }
 }
 
 #[derive(Debug)]
 /// Error returned from [`TxBuilder::add_utxo`] and [`TxBuilder::add_utxos`]
 pub enum AddUtxoError {
-    /// Happens when trying to spend an UTXO that is not in the internal database
+    /// Happens when the [`CreateTx`] implementor cannot look up a UTXO by outpoint.
     UnknownUtxo(OutPoint),
 }
 
@@ -785,7 +926,7 @@ impl TxOrdering {
     /// Uses the thread-local random number generator (rng).
     #[cfg(feature = "std")]
     pub fn sort_tx(&self, tx: &mut Transaction) {
-        self.sort_tx_with_aux_rand(tx, &mut bitcoin::key::rand::thread_rng())
+        self.sort_tx_with_aux_rand(tx, &mut bdk_chain::bitcoin::key::rand::thread_rng())
     }
 
     /// Sort transaction inputs and outputs by [`TxOrdering`] variant.
@@ -795,8 +936,8 @@ impl TxOrdering {
         match self {
             TxOrdering::Untouched => {}
             TxOrdering::Shuffle => {
-                shuffle_slice(&mut tx.input, rng);
-                shuffle_slice(&mut tx.output, rng);
+                util::shuffle_slice(&mut tx.input, rng);
+                util::shuffle_slice(&mut tx.output, rng);
             }
             TxOrdering::Custom {
                 input_sort,
@@ -806,18 +947,6 @@ impl TxOrdering {
                 tx.output.sort_unstable_by(|a, b| output_sort(a, b));
             }
         }
-    }
-}
-
-/// Transaction version
-///
-/// Has a default value of `1`
-#[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
-pub(crate) struct Version(pub(crate) i32);
-
-impl Default for Version {
-    fn default() -> Self {
-        Version(1)
     }
 }
 
@@ -833,16 +962,6 @@ pub enum ChangeSpendPolicy {
     ChangeForbidden,
 }
 
-impl ChangeSpendPolicy {
-    pub(crate) fn is_satisfied_by(&self, utxo: &LocalOutput) -> bool {
-        match self {
-            ChangeSpendPolicy::ChangeAllowed => true,
-            ChangeSpendPolicy::OnlyChange => utxo.keychain == KeychainKind::Internal,
-            ChangeSpendPolicy::ChangeForbidden => utxo.keychain == KeychainKind::External,
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     const ORDERING_TEST_TX: &str = "0200000003c26f3eb7932f7acddc5ddd26602b77e7516079b03090a16e2c2f54\
@@ -853,17 +972,18 @@ mod test {
                                     00000000";
     macro_rules! ordering_test_tx {
         () => {
-            deserialize::<bitcoin::Transaction>(&Vec::<u8>::from_hex(ORDERING_TEST_TX).unwrap())
+            consensus::deserialize::<Transaction>(&Vec::<u8>::from_hex(ORDERING_TEST_TX).unwrap())
                 .unwrap()
         };
     }
 
-    use bdk_chain::ConfirmationTime;
-    use bitcoin::consensus::deserialize;
-    use bitcoin::hex::FromHex;
-    use bitcoin::TxOut;
-
     use super::*;
+    use alloc::vec;
+
+    use bdk_chain::bitcoin::consensus;
+    use bdk_chain::bitcoin::hex::FromHex;
+    use bdk_chain::bitcoin::TxOut;
+
     #[test]
     fn test_output_ordering_untouched() {
         let original_tx = ordering_test_tx!();
@@ -921,21 +1041,21 @@ mod test {
 
         assert_eq!(
             tx.input[0].previous_output,
-            bitcoin::OutPoint::from_str(
+            OutPoint::from_str(
                 "0e53ec5dfb2cb8a71fec32dc9a634a35b7e24799295ddd5278217822e0b31f57:5"
             )
             .unwrap()
         );
         assert_eq!(
             tx.input[1].previous_output,
-            bitcoin::OutPoint::from_str(
+            OutPoint::from_str(
                 "0f60fdd185542f2c6ea19030b0796051e7772b6026dd5ddccd7a2f93b73e6fc2:0"
             )
             .unwrap()
         );
         assert_eq!(
             tx.input[2].previous_output,
-            bitcoin::OutPoint::from_str(
+            OutPoint::from_str(
                 "0f60fdd185542f2c6ea19030b0796051e7772b6026dd5ddccd7a2f93b73e6fc2:1"
             )
             .unwrap()
@@ -951,7 +1071,7 @@ mod test {
 
     #[test]
     fn test_output_ordering_custom_with_sha256() {
-        use bitcoin::hashes::{sha256, Hash};
+        use bdk_chain::bitcoin::hashes::{sha256, Hash};
 
         let original_tx = ordering_test_tx!();
         let mut tx_1 = original_tx.clone();
@@ -1004,78 +1124,5 @@ mod test {
         // Check transaction order has changed
         assert_ne!(tx_1, original_tx);
         assert_ne!(tx_2, original_tx);
-    }
-
-    fn get_test_utxos() -> Vec<LocalOutput> {
-        use bitcoin::hashes::Hash;
-
-        vec![
-            LocalOutput {
-                outpoint: OutPoint {
-                    txid: bitcoin::Txid::from_slice(&[0; 32]).unwrap(),
-                    vout: 0,
-                },
-                txout: TxOut::NULL,
-                keychain: KeychainKind::External,
-                is_spent: false,
-                confirmation_time: ConfirmationTime::Unconfirmed { last_seen: 0 },
-                derivation_index: 0,
-            },
-            LocalOutput {
-                outpoint: OutPoint {
-                    txid: bitcoin::Txid::from_slice(&[0; 32]).unwrap(),
-                    vout: 1,
-                },
-                txout: TxOut::NULL,
-                keychain: KeychainKind::Internal,
-                is_spent: false,
-                confirmation_time: ConfirmationTime::Confirmed {
-                    height: 32,
-                    time: 42,
-                },
-                derivation_index: 1,
-            },
-        ]
-    }
-
-    #[test]
-    fn test_change_spend_policy_default() {
-        let change_spend_policy = ChangeSpendPolicy::default();
-        let filtered = get_test_utxos()
-            .into_iter()
-            .filter(|u| change_spend_policy.is_satisfied_by(u))
-            .count();
-
-        assert_eq!(filtered, 2);
-    }
-
-    #[test]
-    fn test_change_spend_policy_no_internal() {
-        let change_spend_policy = ChangeSpendPolicy::ChangeForbidden;
-        let filtered = get_test_utxos()
-            .into_iter()
-            .filter(|u| change_spend_policy.is_satisfied_by(u))
-            .collect::<Vec<_>>();
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].keychain, KeychainKind::External);
-    }
-
-    #[test]
-    fn test_change_spend_policy_only_internal() {
-        let change_spend_policy = ChangeSpendPolicy::OnlyChange;
-        let filtered = get_test_utxos()
-            .into_iter()
-            .filter(|u| change_spend_policy.is_satisfied_by(u))
-            .collect::<Vec<_>>();
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].keychain, KeychainKind::Internal);
-    }
-
-    #[test]
-    fn test_default_tx_version_1() {
-        let version = Version::default();
-        assert_eq!(version.0, 1);
     }
 }
