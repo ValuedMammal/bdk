@@ -53,7 +53,9 @@ use rand_core::RngCore;
 use descriptor::error::Error as DescriptorError;
 use miniscript::{
     descriptor::KeyMap,
+    plan::{Assets, Plan},
     psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier},
+    ForEachKey,
 };
 
 use bdk_chain::tx_graph::CalculateFeeError;
@@ -1641,6 +1643,7 @@ impl Wallet {
             .map_err(|_| BuildFeeBumpError::FeeRateUnavailable)?;
 
         // remove the inputs from the tx and process them
+        let assets = self.assets();
         let original_txin = tx.input.drain(..).collect::<Vec<_>>();
         let original_utxos = original_txin
             .iter()
@@ -1658,10 +1661,18 @@ impl Wallet {
 
                 let weighted_utxo = match txout_index.index_of_spk(txout.script_pubkey.clone()) {
                     Some(&(keychain, derivation_index)) => {
-                        let satisfaction_weight = self
-                            .public_descriptor(keychain)
-                            .max_weight_to_satisfy()
-                            .unwrap();
+                        let satisfaction_weight = {
+                            let desc = self.public_descriptor(keychain);
+                            let definite_desc = desc
+                                .at_derivation_index(derivation_index)
+                                .expect("must be valid index");
+                            match definite_desc.plan(&assets) {
+                                Ok(plan) => Weight::from_wu_usize(plan.satisfaction_weight()),
+                                Err(_) => desc
+                                    .max_weight_to_satisfy()
+                                    .expect("descriptor must be satisfiable"),
+                            }
+                        };
                         WeightedUtxo {
                             utxo: Utxo::Local(LocalOutput {
                                 outpoint: txin.previous_output,
@@ -1980,15 +1991,27 @@ impl Wallet {
         descriptor.at_derivation_index(child).ok()
     }
 
-    fn get_available_utxos(&self) -> Vec<(LocalOutput, Weight)> {
+    fn get_available_utxos(&self, assets: Assets) -> Vec<(LocalOutput, Weight)> {
+        self.planned_utxos(assets)
+            .into_iter()
+            .map(|(plan, utxo)| {
+                let weight = Weight::from_wu_usize(plan.satisfaction_weight());
+                (utxo, weight)
+            })
+            .collect()
+    }
+
+    /// Planned utxos.
+    fn planned_utxos(&self, assets: Assets) -> Vec<(Plan, LocalOutput)> {
+        let assets = self.assets().add(assets);
         self.list_unspent()
             .map(|utxo| {
-                let keychain = utxo.keychain;
-                (utxo, {
-                    self.public_descriptor(keychain)
-                        .max_weight_to_satisfy()
-                        .unwrap()
-                })
+                let desc = self.public_descriptor(utxo.keychain);
+                let definite_desc = desc
+                    .at_derivation_index(utxo.derivation_index)
+                    .expect("must be valid index");
+                let plan = definite_desc.plan(&assets).expect("failed to create Plan");
+                (plan, utxo)
             })
             .collect()
     }
@@ -2001,6 +2024,7 @@ impl Wallet {
         current_height: Option<u32>,
     ) -> (Vec<WeightedUtxo>, Vec<WeightedUtxo>) {
         let TxParams {
+            assets,
             change_policy,
             unspendable,
             utxos,
@@ -2018,7 +2042,7 @@ impl Wallet {
         let chain_tip = self.chain.tip().block_id();
         //    must_spend <- manually selected utxos
         //    may_spend  <- all other available utxos
-        let mut may_spend = self.get_available_utxos();
+        let mut may_spend = self.get_available_utxos(crate::CloneAssets::clone(assets));
 
         may_spend.retain(|may_spend| {
             !manually_selected
@@ -2461,6 +2485,20 @@ impl Wallet {
         } else {
             keychain
         }
+    }
+
+    /// Returns a baseline set of [`Assets`] by collecting as many unique pubkeys
+    /// as appear in the wallet's descriptors.
+    pub fn assets(&self) -> Assets {
+        use crate::collections::HashSet;
+        let mut pks = HashSet::new();
+        for (_, desc) in self.keychains() {
+            desc.for_each_key(|pk| {
+                pks.insert(pk.clone());
+                true
+            });
+        }
+        Assets::new().add(pks.into_iter().collect::<Vec<_>>())
     }
 }
 

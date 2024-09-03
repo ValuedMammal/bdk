@@ -41,6 +41,7 @@
 use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
 use core::fmt;
+use miniscript::plan::Assets;
 
 use alloc::sync::Arc;
 
@@ -120,8 +121,9 @@ pub struct TxBuilder<'a, Cs> {
 
 /// The parameters for transaction creation sans coin selection algorithm.
 //TODO: TxParams should eventually be exposed publicly.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug)]
 pub(crate) struct TxParams {
+    pub(crate) assets: Assets,
     pub(crate) recipients: Vec<(ScriptBuf, u64)>,
     pub(crate) drain_wallet: bool,
     pub(crate) drain_to: Option<ScriptBuf>,
@@ -163,15 +165,34 @@ impl Default for FeePolicy {
     }
 }
 
-impl<'a, Cs: Clone> Clone for TxBuilder<'a, Cs> {
+/// Workaround until we have `Assets: Clone`
+pub(crate) trait CloneAssets {
+    fn clone(&self) -> Self;
+}
+
+impl CloneAssets for Assets {
     fn clone(&self) -> Self {
-        TxBuilder {
-            wallet: self.wallet.clone(),
-            params: self.params.clone(),
-            coin_selection: self.coin_selection.clone(),
+        Assets {
+            keys: self.keys.clone(),
+            sha256_preimages: self.sha256_preimages.clone(),
+            hash256_preimages: self.hash256_preimages.clone(),
+            ripemd160_preimages: self.ripemd160_preimages.clone(),
+            hash160_preimages: self.hash160_preimages.clone(),
+            absolute_timelock: self.absolute_timelock,
+            relative_timelock: self.relative_timelock,
         }
     }
 }
+
+// impl<'a, Cs: Clone> Clone for TxBuilder<'a, Cs> {
+//     fn clone(&self) -> Self {
+//         TxBuilder {
+//             wallet: self.wallet.clone(),
+//             params: self.params.clone(),
+//             coin_selection: self.coin_selection.clone(),
+//         }
+//     }
+// }
 
 // Methods supported for any CoinSelectionAlgorithm.
 impl<'a, Cs> TxBuilder<'a, Cs> {
@@ -289,6 +310,7 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     pub fn add_utxos(&mut self, outpoints: &[OutPoint]) -> Result<&mut Self, AddUtxoError> {
         {
             let wallet = self.wallet.borrow();
+            let assets = wallet.assets();
             let utxos = outpoints
                 .iter()
                 .map(|outpoint| {
@@ -300,7 +322,15 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
 
             for utxo in utxos {
                 let descriptor = wallet.public_descriptor(utxo.keychain);
-                let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
+                let definite_desc = descriptor
+                    .at_derivation_index(utxo.derivation_index)
+                    .unwrap();
+                let satisfaction_weight = match definite_desc.plan(&assets) {
+                    Ok(plan) => Weight::from_wu_usize(plan.satisfaction_weight()),
+                    Err(_) => descriptor
+                        .max_weight_to_satisfy()
+                        .expect("descriptor must be satisfiable"),
+                };
                 self.params.utxos.push(WeightedUtxo {
                     satisfaction_weight,
                     utxo: Utxo::Local(utxo),
@@ -416,6 +446,12 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
         });
 
         Ok(self)
+    }
+
+    /// Set [`Assets`].
+    pub fn set_assets(&mut self, assets: Assets) -> &mut Self {
+        self.params.assets = assets;
+        self
     }
 
     /// Only spend utxos added by [`add_utxo`].
