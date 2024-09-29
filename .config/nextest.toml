@@ -1,0 +1,23 @@
+[profile.ci]
+# Print output for failing tests as soon as they fail, and also at the end
+failure-output = "immediate-final"
+# Do not cancel run on the first failure
+fail-fast = false
+
+[test-groups]
+serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(bdk_bitcoind_rpc)'
+platform = 'cfg(unix)'
+test-group = 'serial'
+
+[[profile.default.overrides]]
+filter = 'package(bdk_electrum)'
+platform = 'cfg(unix)'
+test-group = 'serial'
+
+[[profile.default.overrides]]
+filter = 'package(bdk_esplora)'
+platform = 'cfg(unix)'
+test-group = 'serial'
