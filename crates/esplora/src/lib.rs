@@ -20,6 +20,8 @@
 //! [`esplora_client::BlockingClient`], [`EsploraAsyncExt`] is the async version which extends
 //! [`esplora_client::AsyncClient`].
 
+#![cfg(any(feature = "async", feature = "blocking"))]
+
 use bdk_core::bitcoin::{Amount, OutPoint, TxOut, Txid};
 use bdk_core::{BlockId, ConfirmationBlockTime, TxUpdate};
 use esplora_client::TxStatus;
