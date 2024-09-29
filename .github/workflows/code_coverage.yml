@@ -13,7 +13,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Install lcov tools
         run: sudo apt-get install lcov -y
       - name: Install Rust toolchain
@@ -23,12 +23,14 @@ jobs:
             override: true
             profile: minimal
             components: llvm-tools-preview
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2.2.1
       - name: Install grcov
         run: if [[ ! -e ~/.cargo/bin/grcov ]]; then cargo install grcov; fi
       - name: Test
-        run: cargo test --all-features
+        run: cargo nextest run --profile ci --all-features
       - name: Make coverage directory
         run: mkdir coverage
       - name: Run grcov
