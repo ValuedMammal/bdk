@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::fmt::{self, Formatter};
 
-use bdk_chain::bitcoin;
+use bdk_chain::bitcoin::{self, OutPoint};
 use bitcoin::{consensus::encode::serialize, Amount, FeeRate, Script, TxIn, Weight};
 use rand_core::RngCore;
 
@@ -96,6 +96,11 @@ impl Selection {
             .iter()
             .map(|u| u.txout().expect("candidate must have txout").value.to_sat())
             .sum()
+    }
+
+    /// The total value of the inputs selected.
+    pub fn selected_coins(&self) -> Vec<OutPoint> {
+        self.selected.iter().map(|u| u.outpoint).collect()
     }
 }
 
@@ -279,7 +284,7 @@ fn select_sorted_utxos(
 }
 
 #[derive(Debug, Clone)]
-// Adds fee information to an UTXO.
+/// Adds fee information to a UTXO.
 struct EffectiveUtxo {
     utxo: CandidateUtxo,
     // Amount of fees for spending a certain utxo, calculated using a certain FeeRate
@@ -306,7 +311,7 @@ impl EffectiveUtxo {
         }
     }
 
-    /// Get the TxOut of this utxo
+    /// Get the TxOut of this UTXO
     fn txout(&self) -> bitcoin::TxOut {
         self.utxo.txout().expect("candidate must have txout")
     }
@@ -484,7 +489,7 @@ impl<Cs> BranchAndBoundCoinSelection<Cs> {
         let mut current_selection: Vec<bool> = Vec::with_capacity(optional_utxos.len());
 
         // Sort the utxo_pool
-        optional_utxos.sort_unstable_by_key(|a| a.effective_value);
+        optional_utxos.sort_by_key(|a| a.effective_value);
         optional_utxos.reverse();
 
         // Contains the best selection we found

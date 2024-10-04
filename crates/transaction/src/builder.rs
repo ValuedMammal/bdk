@@ -123,8 +123,8 @@ pub struct TxParams {
     pub(crate) fee_policy: Option<FeePolicy>,
     pub(crate) internal_policy_path: Option<BTreeMap<String, Vec<usize>>>,
     pub(crate) external_policy_path: Option<BTreeMap<String, Vec<usize>>>,
-    pub(crate) utxos: HashSet<OutPoint>, // candidates that can be looked up by outpoint
-    pub(crate) candidates: HashSet<CandidateUtxo>, // foreign utxos
+    pub(crate) utxos: Vec<OutPoint>, // candidates that can be looked up by outpoint
+    pub(crate) candidates: Vec<CandidateUtxo>, // foreign utxos
     pub(crate) unspendable: HashSet<OutPoint>,
     pub(crate) manually_selected_only: bool,
     pub(crate) sighash: Option<psbt::PsbtSighashType>,
@@ -228,6 +228,7 @@ impl Default for FeePolicy {
     }
 }
 
+// impl getters for `TxParams` that can be cloned or copied
 macro_rules! impl_get_field_clone {
     ($($field:ident, $ret:ty,)*) => {
         paste::paste! {
@@ -263,8 +264,8 @@ impl_get_field_clone!(
     fee_policy, Option<FeePolicy>,
     internal_policy_path, Option<BTreeMap<String, Vec<usize>>>,
     external_policy_path, Option<BTreeMap<String, Vec<usize>>>,
-    utxos, HashSet<OutPoint>,
-    candidates, HashSet<CandidateUtxo>,
+    utxos, Vec<OutPoint>,
+    candidates, Vec<CandidateUtxo>,
     unspendable, HashSet<OutPoint>,
     sighash, Option<psbt::PsbtSighashType>,
     ordering, TxOrdering,
@@ -285,15 +286,26 @@ impl_get_field!(
     allow_dust, bool,
 );
 
+impl TxParams {
+    /// Get [`Assets`] parameter.
+    pub fn assets(&self) -> &Assets {
+        &self.assets
+    }
+}
+
 /// Implemented on [`Assets`] so that one instance can be extended from a reference
 /// of the same type.
 // TODO: try upstream some form of this to rust-miniscript
 pub trait AssetsExt {
     /// Extend `self` with the contents of `other`.
     fn extend(&mut self, other: &Self);
+    /// Is empty
+    fn is_empty(&self) -> bool;
 }
 
 impl AssetsExt for Assets {
+    /// Extends `self` with the contents of `other`. Note that if set,
+    /// this preferentially uses the timelock value of `other`.
     fn extend(&mut self, other: &Self) {
         self.keys.extend(other.keys.clone());
         self.sha256_preimages.extend(other.sha256_preimages.clone());
@@ -304,9 +316,19 @@ impl AssetsExt for Assets {
         self.hash160_preimages
             .extend(other.hash160_preimages.clone());
 
-        // note: should this look for the higher of the two values?
-        self.relative_timelock = other.relative_timelock.or(self.relative_timelock);
         self.absolute_timelock = other.absolute_timelock.or(self.absolute_timelock);
+        self.relative_timelock = other.relative_timelock.or(self.relative_timelock);
+    }
+
+    /// Whether this [`Assets`] is empty.
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+            && self.sha256_preimages.is_empty()
+            && self.hash256_preimages.is_empty()
+            && self.ripemd160_preimages.is_empty()
+            && self.hash160_preimages.is_empty()
+            && self.absolute_timelock.is_none()
+            && self.relative_timelock.is_none()
     }
 }
 
@@ -322,7 +344,7 @@ impl<'a, Cs: CoinSelectionAlgorithm, T> TxBuilder<'a, Cs, T> {
 }
 
 impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
-    /// Set candidate utxos.
+    /// Set candidate UTXOs
     pub fn set_candidates(
         &mut self,
         candidates: impl IntoIterator<Item = CandidateUtxo>,
@@ -553,7 +575,7 @@ impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
             }
         }
 
-        self.params.candidates.insert(CandidateUtxo {
+        self.params.candidates.push(CandidateUtxo {
             satisfaction_weight,
             outpoint,
             sequence: Some(sequence),

@@ -54,7 +54,9 @@ use rand_core::RngCore;
 use descriptor::error::Error as DescriptorError;
 use miniscript::{
     descriptor::KeyMap,
+    plan::Assets,
     psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier},
+    ForEachKey,
 };
 
 use bdk_chain::tx_graph::CalculateFeeError;
@@ -1447,7 +1449,7 @@ impl Wallet {
         fee_amount += fee_rate * tx.weight();
 
         // get all manually added utxos
-        let mut wutxos: HashSet<WeightedUtxo> = params
+        let mut wutxos: Vec<WeightedUtxo> = params
             .utxos()
             .iter()
             .map(|outpoint| {
@@ -1464,7 +1466,7 @@ impl Wallet {
                     })
                     .ok_or(CreateTxError::UnknownUtxo)
             })
-            .collect::<Result<HashSet<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         wutxos.extend(params.candidates().iter().cloned().map(WeightedUtxo::from));
 
@@ -1684,7 +1686,7 @@ impl Wallet {
                     .get_tx(txin.previous_output.txid)
                     .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))?;
                 let txout = &prev_tx.output[txin.previous_output.vout as usize];
-                let is_witness = txout.script_pubkey.is_witness_program();
+                let is_witness_prog = txout.script_pubkey.is_witness_program();
 
                 let weighted_utxo = match txout_index.index_of_spk(txout.script_pubkey.clone()) {
                     // This is a local utxo
@@ -1704,7 +1706,7 @@ impl Wallet {
                             confirmation_time,
                             sequence: Some(txin.sequence),
                             psbt_input: Box::new(psbt::Input {
-                                witness_utxo: if is_witness {
+                                witness_utxo: if is_witness_prog {
                                     Some(txout.clone())
                                 } else {
                                     None
@@ -1726,7 +1728,7 @@ impl Wallet {
                             confirmation_time: None,
                             sequence: Some(txin.sequence),
                             psbt_input: Box::new(psbt::Input {
-                                witness_utxo: if is_witness {
+                                witness_utxo: if is_witness_prog {
                                     Some(txout.clone())
                                 } else {
                                     None
@@ -2044,7 +2046,7 @@ impl Wallet {
     /// transaction and any further that may be used if needed.
     fn preselect_utxos(
         &self,
-        weighted_utxos: HashSet<WeightedUtxo>,
+        weighted_utxos: Vec<WeightedUtxo>,
         params: &TxParams,
         current_height: Option<u32>,
     ) -> (Vec<CandidateUtxo>, Vec<CandidateUtxo>) {
@@ -2500,6 +2502,18 @@ impl Wallet {
             .indexed_graph
             .batch_insert_relevant_unconfirmed(unconfirmed_txs);
         self.stage.merge(indexed_graph_changeset.into());
+    }
+
+    /// Internally collect the baseline [`Assets`].
+    pub fn assets(&self) -> Assets {
+        let mut pks = vec![];
+        for (_, desc) in self.keychains() {
+            desc.for_each_key(|key| {
+                pks.push(key.clone());
+                true
+            });
+        }
+        Assets::new().add(pks.into_iter().collect::<Vec<_>>())
     }
 
     /// Used internally to ensure that all methods requiring a [`KeychainKind`] will use a
