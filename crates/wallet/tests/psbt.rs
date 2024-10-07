@@ -13,9 +13,9 @@ fn test_psbt_malformed_psbt_input_legacy() {
     let psbt_bip = Psbt::from_str(PSBT_STR).unwrap();
     let (mut wallet, _) = get_funded_wallet(get_test_wpkh());
     let send_to = wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = wallet.tx_builder();
+    let mut builder = wallet.build_tx();
     builder.add_recipient(send_to.script_pubkey(), Amount::from_sat(10_000));
-    let mut psbt = builder.build_tx().unwrap();
+    let mut psbt = builder.finish().unwrap();
     psbt.inputs.push(psbt_bip.inputs[0].clone());
     let options = SignOptions {
         trust_witness_utxo: true,
@@ -30,9 +30,9 @@ fn test_psbt_malformed_psbt_input_segwit() {
     let psbt_bip = Psbt::from_str(PSBT_STR).unwrap();
     let (mut wallet, _) = get_funded_wallet(get_test_wpkh());
     let send_to = wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = wallet.tx_builder();
+    let mut builder = wallet.build_tx();
     builder.add_recipient(send_to.script_pubkey(), Amount::from_sat(10_000));
-    let mut psbt = builder.build_tx().unwrap();
+    let mut psbt = builder.finish().unwrap();
     psbt.inputs.push(psbt_bip.inputs[1].clone());
     let options = SignOptions {
         trust_witness_utxo: true,
@@ -46,9 +46,9 @@ fn test_psbt_malformed_psbt_input_segwit() {
 fn test_psbt_malformed_tx_input() {
     let (mut wallet, _) = get_funded_wallet(get_test_wpkh());
     let send_to = wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = wallet.tx_builder();
+    let mut builder = wallet.build_tx();
     builder.add_recipient(send_to.script_pubkey(), Amount::from_sat(10_000));
-    let mut psbt = builder.build_tx().unwrap();
+    let mut psbt = builder.finish().unwrap();
     psbt.unsigned_tx.input.push(TxIn::default());
     let options = SignOptions {
         trust_witness_utxo: true,
@@ -62,9 +62,9 @@ fn test_psbt_sign_with_finalized() {
     let psbt_bip = Psbt::from_str(PSBT_STR).unwrap();
     let (mut wallet, _) = get_funded_wallet(get_test_wpkh());
     let send_to = wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = wallet.tx_builder();
+    let mut builder = wallet.build_tx();
     builder.add_recipient(send_to.script_pubkey(), Amount::from_sat(10_000));
-    let mut psbt = builder.build_tx().unwrap();
+    let mut psbt = builder.finish().unwrap();
 
     // add a finalized input
     psbt.inputs.push(psbt_bip.inputs[0].clone());
@@ -83,10 +83,10 @@ fn test_psbt_fee_rate_with_witness_utxo() {
 
     let (mut wallet, _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
     let addr = wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = wallet.tx_builder();
-    builder.set_drain_to(addr.script_pubkey()).drain_wallet();
+    let mut builder = wallet.build_tx();
+    builder.drain_to(addr.script_pubkey()).drain_wallet();
     builder.fee_rate(expected_fee_rate);
-    let mut psbt = builder.build_tx().unwrap();
+    let mut psbt = builder.finish().unwrap();
     let fee_amount = psbt.fee_amount();
     assert!(fee_amount.is_some());
 
@@ -108,10 +108,10 @@ fn test_psbt_fee_rate_with_nonwitness_utxo() {
 
     let (mut wallet, _) = get_funded_wallet("pkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
     let addr = wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = wallet.tx_builder();
-    builder.set_drain_to(addr.script_pubkey()).drain_wallet();
+    let mut builder = wallet.build_tx();
+    builder.drain_to(addr.script_pubkey()).drain_wallet();
     builder.fee_rate(expected_fee_rate);
-    let mut psbt = builder.build_tx().unwrap();
+    let mut psbt = builder.finish().unwrap();
     let fee_amount = psbt.fee_amount();
     assert!(fee_amount.is_some());
     let unfinalized_fee_rate = psbt.fee_rate().unwrap();
@@ -132,10 +132,10 @@ fn test_psbt_fee_rate_with_missing_txout() {
 
     let (mut wpkh_wallet,  _) = get_funded_wallet("wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)");
     let addr = wpkh_wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = wpkh_wallet.tx_builder();
-    builder.set_drain_to(addr.script_pubkey()).drain_wallet();
+    let mut builder = wpkh_wallet.build_tx();
+    builder.drain_to(addr.script_pubkey()).drain_wallet();
     builder.fee_rate(expected_fee_rate);
-    let mut wpkh_psbt = builder.build_tx().unwrap();
+    let mut wpkh_psbt = builder.finish().unwrap();
 
     wpkh_psbt.inputs[0].witness_utxo = None;
     wpkh_psbt.inputs[0].non_witness_utxo = None;
@@ -146,10 +146,10 @@ fn test_psbt_fee_rate_with_missing_txout() {
     let change_desc = "pkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/1)";
     let (mut pkh_wallet, _) = get_funded_wallet_with_change(desc, change_desc);
     let addr = pkh_wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = pkh_wallet.tx_builder();
-    builder.set_drain_to(addr.script_pubkey()).drain_wallet();
+    let mut builder = pkh_wallet.build_tx();
+    builder.drain_to(addr.script_pubkey()).drain_wallet();
     builder.fee_rate(expected_fee_rate);
-    let mut pkh_psbt = builder.build_tx().unwrap();
+    let mut pkh_psbt = builder.finish().unwrap();
 
     pkh_psbt.inputs[0].non_witness_utxo = None;
     assert!(pkh_psbt.fee_amount().is_none());
@@ -176,9 +176,9 @@ fn test_psbt_multiple_internalkey_signers() {
     let (mut wallet, _) = get_funded_wallet_with_change(&desc, change_desc);
     let to_spend = wallet.balance().total();
     let send_to = wallet.peek_address(KeychainKind::External, 0);
-    let mut builder = wallet.tx_builder();
-    builder.set_drain_to(send_to.script_pubkey()).drain_wallet();
-    let mut psbt = builder.build_tx().unwrap();
+    let mut builder = wallet.build_tx();
+    builder.drain_to(send_to.script_pubkey()).drain_wallet();
+    let mut psbt = builder.finish().unwrap();
     let unsigned_tx = psbt.unsigned_tx.clone();
 
     // Adds a signer for the wrong internal key, bdk should not use this key to sign

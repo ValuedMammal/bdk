@@ -76,10 +76,10 @@ fn main() -> Result<(), anyhow::Error> {
         std::process::exit(0);
     }
 
-    let mut tx_builder = wallet.tx_builder();
+    let mut tx_builder = wallet.build_tx();
     tx_builder.add_recipient(address.script_pubkey(), SEND_AMOUNT);
 
-    let mut psbt = tx_builder.build_tx()?;
+    let mut psbt = tx_builder.finish()?;
     let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
     assert!(finalized);
 

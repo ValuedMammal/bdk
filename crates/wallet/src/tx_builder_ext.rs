@@ -20,13 +20,13 @@ use bdk_transaction::{coin_selection::CoinSelectionAlgorithm, CreateTx, TxBuilde
 /// requires "std" feature.
 pub trait TxBuilderExt {
     /// Create a new unsigned PSBT.
-    fn build_tx(&mut self) -> Result<Psbt, CreateTxError>;
+    fn finish(&mut self) -> Result<Psbt, CreateTxError>;
 }
 
 #[cfg(feature = "std")]
 impl<'a, Cs: CoinSelectionAlgorithm> TxBuilderExt for TxBuilder<'a, Cs, Wallet> {
-    fn build_tx(&mut self) -> Result<Psbt, CreateTxError> {
-        self.build_tx_with_aux_rand(&mut bitcoin::key::rand::thread_rng())
+    fn finish(&mut self) -> Result<Psbt, CreateTxError> {
+        self.finish_with_aux_rand(&mut bitcoin::key::rand::thread_rng())
     }
 }
 
@@ -35,10 +35,10 @@ impl CreateTx for Wallet {
 
     fn create_tx(
         &mut self,
-        params: bdk_transaction::TxParams,
         coin_selection: impl CoinSelectionAlgorithm,
+        params: bdk_transaction::TxParams,
         rng: &mut impl RngCore,
     ) -> Result<Psbt, Self::Error> {
-        self.create_tx_with_aux_rand(params, coin_selection, rng)
+        self.create_tx(coin_selection, params, rng)
     }
 }

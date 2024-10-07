@@ -37,6 +37,14 @@ use bdk_chain::{
     BlockId, ChainPosition, ConfirmationBlockTime, ConfirmationTime, DescriptorExt, FullTxOut,
     Indexed, IndexedTxGraph, Merge,
 };
+use bdk_transaction::{
+    coin_selection::{
+        CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm,
+        Excess::{self, Change, NoChange},
+        InsufficientFunds, IsDust,
+    },
+    CandidateUtxo, ChangeSpendPolicy, FeePolicy, PreviousFee, TxBuilder, TxParams,
+};
 use bitcoin::sighash::{EcdsaSighashType, TapSighashType};
 use bitcoin::{
     absolute, psbt, Address, Block, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction,
@@ -73,10 +81,6 @@ pub(crate) mod utils;
 
 pub mod error;
 
-use bdk_transaction::coin_selection::DefaultCoinSelectionAlgorithm;
-use bdk_transaction::coin_selection::Excess::{self, Change, NoChange};
-use bdk_transaction::coin_selection::InsufficientFunds;
-use bdk_transaction::coin_selection::{CoinSelectionAlgorithm, IsDust};
 use signer::{SignOptions, SignerOrdering, SignersContainer, TransactionSigner};
 use utils::{check_nsequence_rbf, After, Older, SecpCtx};
 
@@ -89,9 +93,6 @@ use crate::psbt::PsbtUtils;
 use crate::signer::SignerError;
 use crate::types::*;
 use crate::wallet::error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError};
-use bdk_transaction::{
-    CandidateUtxo, ChangeSpendPolicy, FeePolicy, PreviousFee, TxBuilder, TxParams,
-};
 
 const COINBASE_MATURITY: u32 = 100;
 
@@ -1223,24 +1224,24 @@ impl Wallet {
     /// # let mut wallet = doctest_wallet!();
     /// # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap().assume_checked();
     /// let psbt = {
-    ///    let mut builder =  wallet.tx_builder();
+    ///    let mut builder =  wallet.build_tx();
     ///    builder
     ///        .add_recipient(to_address.script_pubkey(), Amount::from_sat(50_000));
-    ///    builder.build_tx()?
+    ///    builder.finish()?
     /// };
     ///
     /// // sign and broadcast ...
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn tx_builder(&mut self) -> TxBuilder<DefaultCoinSelectionAlgorithm, Self> {
+    pub fn build_tx(&mut self) -> TxBuilder<DefaultCoinSelectionAlgorithm, Self> {
         TxBuilder::new(DefaultCoinSelectionAlgorithm::default(), self)
     }
 
     /// Create tx with aux rand.
-    pub(crate) fn create_tx_with_aux_rand(
+    pub(crate) fn create_tx(
         &mut self,
-        params: TxParams,
         coin_selection: impl CoinSelectionAlgorithm,
+        params: TxParams,
         rng: &mut impl RngCore,
     ) -> Result<Psbt, CreateTxError> {
         let keychains: BTreeMap<_, _> = self.indexed_graph.index.keychains().collect();
@@ -1473,14 +1474,12 @@ impl Wallet {
         let (required_utxos, optional_utxos) =
             self.preselect_utxos(wutxos, &params, Some(current_height.to_consensus_u32()));
 
-        // TODO: is there a way to ensure the wallet never produces duplicate utxos
-        // instead of de-duplicating after `preselect_utxos`?
         let (required_utxos, optional_utxos) =
             utils::filter_duplicates(required_utxos, optional_utxos);
 
         // get drain script
         let mut drain_index = Option::<(KeychainKind, u32)>::None;
-        let drain_script = match params.drain_to() {
+        let drain_script = match params.drain() {
             Some(ref drain_recipient) => drain_recipient.clone(),
             None => {
                 let change_keychain = self.map_keychain(KeychainKind::Internal);
@@ -1505,7 +1504,7 @@ impl Wallet {
             }
         };
 
-        let selection = coin_selection
+        let coin_selection = coin_selection
             .coin_select(
                 required_utxos,
                 optional_utxos,
@@ -1516,10 +1515,10 @@ impl Wallet {
             )
             .map_err(CreateTxError::CoinSelection)?;
 
-        fee_amount += Amount::from_sat(selection.fee_amount);
-        let excess = &selection.excess;
+        fee_amount += Amount::from_sat(coin_selection.fee_amount);
+        let excess = &coin_selection.excess;
 
-        tx.input = selection
+        tx.input = coin_selection
             .selected
             .iter()
             .map(|u| bitcoin::TxIn {
@@ -1538,8 +1537,7 @@ impl Wallet {
             // - We have a drain_to address and drain_wallet set
             // Otherwise, we don't know who we should send the funds to, and how much
             // we should send!
-            if params.drain_to().is_some() && (params.drain_wallet() || !params.utxos().is_empty())
-            {
+            if params.drain().is_some() && (params.drain_wallet() || !params.utxos().is_empty()) {
                 if let NoChange {
                     dust_threshold,
                     remaining_amount,
@@ -1582,7 +1580,7 @@ impl Wallet {
         // sort input/outputs according to the chosen algorithm
         params.ordering().sort_tx_with_aux_rand(&mut tx, rng);
 
-        let psbt = self.complete_transaction(tx, selection.selected, params)?;
+        let psbt = self.complete_transaction(tx, coin_selection.selected, params)?;
 
         // recording changes to the change keychain
         if let (Excess::Change { .. }, Some((keychain, index))) = (excess, drain_index) {
@@ -1618,10 +1616,10 @@ impl Wallet {
     /// # let mut wallet = doctest_wallet!();
     /// # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap().assume_checked();
     /// let mut psbt = {
-    ///     let mut builder = wallet.tx_builder();
+    ///     let mut builder = wallet.build_tx();
     ///     builder
     ///         .add_recipient(to_address.script_pubkey(), Amount::from_sat(50_000));
-    ///     builder.build_tx()?
+    ///     builder.finish()?
     /// };
     /// let _ = wallet.sign(&mut psbt, SignOptions::default())?;
     /// let tx = psbt.clone().extract_tx().expect("tx");
@@ -1630,7 +1628,7 @@ impl Wallet {
     ///     let mut builder = wallet.build_fee_bump(tx.compute_txid())?;
     ///     builder
     ///         .fee_rate(FeeRate::from_sat_per_vb(5).expect("valid feerate"));
-    ///     builder.build_tx()?
+    ///     builder.finish()?
     /// };
     ///
     /// let _ = wallet.sign(&mut psbt, SignOptions::default())?;
@@ -1686,61 +1684,39 @@ impl Wallet {
                     .get_tx(txin.previous_output.txid)
                     .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))?;
                 let txout = &prev_tx.output[txin.previous_output.vout as usize];
-                let is_witness_prog = txout.script_pubkey.is_witness_program();
-
-                let weighted_utxo = match txout_index.index_of_spk(txout.script_pubkey.clone()) {
-                    // This is a local utxo
-                    Some(&(keychain, _)) => {
-                        let satisfaction_weight = self
+                let confirmation_time: ConfirmationTime = graph
+                    .get_chain_position(&self.chain, chain_tip, txin.previous_output.txid)
+                    .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))?
+                    .cloned()
+                    .into();
+                let satisfaction_weight =
+                    match txout_index.index_of_spk(txout.script_pubkey.clone()) {
+                        // if this is a local utxo we get the satisfaction weight from the descriptor,
+                        // otherwise we compute it from the serialized size of the signature data
+                        Some(&(keychain, _)) => self
                             .public_descriptor(keychain)
                             .max_weight_to_satisfy()
-                            .expect("descriptor should be satisfiable");
-                        let confirmation_time = self
-                            .get_utxo(txin.previous_output)
-                            .map(|utxo| utxo.confirmation_time);
-
-                        CandidateUtxo {
-                            outpoint: txin.previous_output,
-                            satisfaction_weight,
-                            txout: Some(txout.clone()),
-                            confirmation_time,
-                            sequence: Some(txin.sequence),
-                            psbt_input: Box::new(psbt::Input {
-                                witness_utxo: if is_witness_prog {
-                                    Some(txout.clone())
-                                } else {
-                                    None
-                                },
-                                non_witness_utxo: Some(prev_tx.as_ref().clone()),
-                                ..Default::default()
-                            }),
-                        }
-                    }
-                    // This is a foreign utxo
-                    None => {
-                        let satisfaction_weight = Weight::from_wu_usize(
+                            .expect("descriptor should be satisfiable"),
+                        None => Weight::from_wu_usize(
                             serialize(&txin.script_sig).len() * 4 + serialize(&txin.witness).len(),
-                        );
-                        CandidateUtxo {
-                            outpoint: txin.previous_output,
-                            satisfaction_weight,
-                            txout: Some(txout.clone()),
-                            confirmation_time: None,
-                            sequence: Some(txin.sequence),
-                            psbt_input: Box::new(psbt::Input {
-                                witness_utxo: if is_witness_prog {
-                                    Some(txout.clone())
-                                } else {
-                                    None
-                                },
-                                non_witness_utxo: Some(prev_tx.as_ref().clone()),
-                                ..Default::default()
-                            }),
-                        }
-                    }
-                };
-
-                Ok(weighted_utxo)
+                        ),
+                    };
+                Ok(CandidateUtxo {
+                    outpoint: txin.previous_output,
+                    satisfaction_weight,
+                    txout: Some(txout.clone()),
+                    confirmation_time: Some(confirmation_time),
+                    sequence: Some(txin.sequence),
+                    psbt_input: Box::new(psbt::Input {
+                        witness_utxo: if txout.script_pubkey.is_witness_program() {
+                            Some(txout.clone())
+                        } else {
+                            None
+                        },
+                        non_witness_utxo: Some(prev_tx.as_ref().clone()),
+                        ..Default::default()
+                    }),
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1761,16 +1737,16 @@ impl Wallet {
             }
         }
 
-        let mut builder = self.tx_builder();
+        let mut builder = self.build_tx();
         builder
             .version(tx.version.0)
-            .set_candidates(original_utxos)
             .set_recipients(
                 tx.output
                     .into_iter()
                     .map(|txout| (txout.script_pubkey, txout.value))
                     .collect(),
             )
+            .set_candidates(original_utxos)
             .set_previous_fee(PreviousFee {
                 absolute: fee,
                 rate: fee_rate,
@@ -1799,9 +1775,9 @@ impl Wallet {
     /// # let mut wallet = doctest_wallet!();
     /// # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap().assume_checked();
     /// let mut psbt = {
-    ///     let mut builder = wallet.tx_builder();
+    ///     let mut builder = wallet.build_tx();
     ///     builder.add_recipient(to_address.script_pubkey(), Amount::from_sat(50_000));
-    ///     builder.build_tx()?
+    ///     builder.finish()?
     /// };
     /// let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
     /// assert!(finalized, "we should have signed all the inputs");
@@ -2022,8 +1998,8 @@ impl Wallet {
         descriptor.at_derivation_index(child).ok()
     }
 
-    /// Get available utxos from the list of unspent, filtering out ones that already
-    /// exist in `must_use`.
+    /// Get available utxos from the list of unspent, filtering out the ones that are
+    /// already found in `must_use`.
     fn get_available_utxos(&self, must_use: &HashSet<OutPoint>) -> Vec<(Weight, LocalOutput)> {
         self.list_unspent()
             .filter_map(|output| {

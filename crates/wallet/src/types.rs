@@ -10,17 +10,16 @@
 // licenses.
 
 use alloc::boxed::Box;
-use bdk_transaction::CandidateUtxo;
 use core::convert::AsRef;
+use serde::{Deserialize, Serialize};
 
 use bdk_chain::ConfirmationTime;
+use bdk_transaction::CandidateUtxo;
 use bitcoin::{
     psbt,
     transaction::{OutPoint, Sequence, TxOut},
     Weight,
 };
-
-use serde::{Deserialize, Serialize};
 
 /// Types of keychains
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -70,7 +69,7 @@ pub struct LocalOutput {
 }
 
 /// A [`Utxo`] with its `satisfaction_weight`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedUtxo {
     /// The weight of the witness data and `scriptSig` expressed in [weight units]. This is used to
     /// properly maintain the feerate when adding this input to a transaction during coin selection.
@@ -81,7 +80,7 @@ pub struct WeightedUtxo {
     pub utxo: Utxo,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// An unspent transaction output (UTXO).
 pub enum Utxo {
     /// A UTXO owned by the local wallet.
@@ -171,7 +170,7 @@ impl From<CandidateUtxo> for WeightedUtxo {
 }
 
 impl LocalOutput {
-    /// Satisfies change policy.
+    /// Whether this [`LocalOutput`] satisfies the given `change_policy`.
     pub(crate) fn satisfies_change_policy(
         &self,
         change_policy: &bdk_transaction::ChangeSpendPolicy,

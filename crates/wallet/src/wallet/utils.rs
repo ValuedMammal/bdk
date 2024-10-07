@@ -121,12 +121,12 @@ where
 
 #[cfg(test)]
 mod test {
+    use super::check_nsequence_rbf;
+    use bitcoin::Sequence;
+
     // When nSequence is lower than this flag the timelock is interpreted as block-height-based,
     // otherwise it's time-based
     pub(crate) const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
-
-    use super::check_nsequence_rbf;
-    use crate::bitcoin::Sequence;
 
     #[test]
     fn test_check_nsequence_rbf_msb_set() {
