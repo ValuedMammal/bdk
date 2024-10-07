@@ -4,7 +4,6 @@ members = [
     "crates/wallet",
     "crates/chain",
     "crates/core",
-    "crates/transaction",
     "crates/file_store",
     "crates/electrum",
     "crates/esplora",
