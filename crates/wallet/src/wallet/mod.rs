@@ -1101,6 +1101,37 @@ impl Wallet {
         ret
     }
 
+    /// Wallet transactions sorted topologically.
+    ///
+    /// See also the documentation for [`bdk_chain::package::Pool`].
+    pub fn transactions_topological(&self) -> impl Iterator<Item = WalletTx> {
+        use bdk_chain::package::Pool;
+        // first allocate a map of Txid -> WalletTx
+        let wallet_txs: HashMap<Txid, WalletTx> = self
+            .transactions()
+            .map(|tx| (tx.tx_node.txid, tx))
+            .collect();
+        // create a `Pool` of wallet txs and their chain positions
+        let txs = wallet_txs.values().map(|tx| {
+            let pos = tx.chain_position.cloned();
+            let tx = tx.tx_node.tx.clone();
+            (Some(pos), tx)
+        });
+        let mut pool = Pool::from_chain_position_txs(txs);
+        // map sorted packages back to `WalletTx`s
+        pool.select_packages().into_iter().flat_map(move |package| {
+            package
+                .txids()
+                .map(|txid| {
+                    wallet_txs
+                        .get(&txid)
+                        .cloned()
+                        .expect("wallet tx must exist")
+                })
+                .collect::<Vec<_>>()
+        })
+    }
+
     /// Iterate over the transactions in the wallet.
     pub fn transactions(&self) -> impl Iterator<Item = WalletTx> + '_ {
         self.indexed_graph

@@ -65,6 +65,8 @@ pub mod rusqlite_impl;
 pub extern crate bdk_core;
 pub use bdk_core::*;
 
+pub mod package;
+
 #[allow(unused_imports)]
 #[macro_use]
 extern crate alloc;

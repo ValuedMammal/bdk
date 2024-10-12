@@ -4308,3 +4308,75 @@ fn test_transactions_sort_by() {
         .collect();
     assert_eq!([None, Some(2000), Some(1000)], conf_heights.as_slice());
 }
+
+#[test]
+fn test_transactions_topological() {
+    let desc = get_test_tr_single_sig_xprv();
+    let mut wallet = Wallet::create_single(desc)
+        .network(Network::Testnet)
+        .create_wallet_no_persist()
+        .unwrap();
+    /*
+           A
+          / \
+         B   C
+              \
+               D
+    */
+
+    let tx_a = Transaction {
+        output: vec![TxOut::NULL, TxOut::NULL],
+        ..new_tx(0)
+    };
+    let txid_a = tx_a.compute_txid();
+    let tx_b = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint::new(txid_a, 0),
+            ..Default::default()
+        }],
+        output: vec![TxOut::NULL],
+        ..new_tx(1)
+    };
+    let txid_b = tx_b.compute_txid();
+    let tx_c = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint::new(txid_a, 1),
+            ..Default::default()
+        }],
+        output: vec![TxOut::NULL],
+        ..new_tx(2)
+    };
+    let txid_c = tx_c.compute_txid();
+    let tx_d = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint::new(txid_c, 0),
+            ..Default::default()
+        }],
+        output: vec![TxOut::NULL],
+        ..new_tx(3)
+    };
+    let txid_d = tx_d.compute_txid();
+
+    for tx in [tx_a, tx_b, tx_c, tx_d] {
+        let txid = tx.compute_txid();
+        let seen_at = tx.lock_time.to_consensus_u32();
+        wallet.insert_tx(tx);
+        insert_seen_at(&mut wallet, txid, seen_at as u64);
+    }
+
+    let exp = vec![txid_a, txid_b, txid_c, txid_d];
+
+    // sort wallet txs topologically
+    let txs = wallet.transactions_topological();
+    let sorted_txids: Vec<_> = txs.map(|tx| tx.tx_node.txid).collect();
+    assert_eq!(sorted_txids, exp);
+}
+
+fn new_tx(lt: u32) -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version(1),
+        lock_time: absolute::LockTime::from_consensus(lt),
+        input: vec![],
+        output: vec![],
+    }
+}
