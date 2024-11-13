@@ -2943,14 +2943,36 @@ fn test_unused_address() {
 
 #[test]
 #[allow(unused)]
-fn replace_tx() {
-    let (mut wallet, txid0) = get_funded_wallet_wpkh();
+fn allow_shrinking() {
+    // 1 in 1 out
+    // shrink the 1 output
+
+    // 1 in 2 out
+    // shrink the larger output by a max of
+
+    let (mut wallet, _) = get_funded_wallet_wpkh();
+    let amount = wallet.balance().total();
+    let fee = Amount::from_sat(200);
+    let addr = wallet.next_unused_address(KeychainKind::External);
+    let addr2 = wallet.next_unused_address(KeychainKind::External);
+
+    let mut builder = wallet.build_tx();
+    builder
+        .add_recipient(addr.script_pubkey(), Amount::from_sat(30_000))
+        .add_recipient(addr2.script_pubkey(), Amount::from_sat(20_000));
+    let mut psbt = builder.finish().unwrap();
+    wallet.sign(&mut psbt, SignOptions::default()).unwrap();
+    let tx = psbt.extract_tx().unwrap();
+    dbg!(&tx.output);
+}
+
+#[test]
+fn test_replace_tx() {
+    let (mut wallet, _txid0) = get_funded_wallet_wpkh();
     assert_eq!(wallet.balance().total().to_sat(), 50_000);
     let addr = wallet.reveal_next_address(KeychainKind::External);
 
-    // dbg!(txid0);
-    // 1 unspent 50k
-
+    // create tx1
     let mut builder = wallet.build_tx();
     builder.add_recipient(addr.script_pubkey(), Amount::from_sat(42_000));
     let mut psbt = builder.finish().unwrap();
@@ -2958,7 +2980,6 @@ fn replace_tx() {
     assert!(finalized);
     let tx = psbt.extract_tx().unwrap();
     let feerate = wallet.calculate_fee_rate(&tx).unwrap().to_sat_per_kwu();
-    // dbg!(&tx);
     let txid = tx.compute_txid();
     insert_tx(&mut wallet, tx);
     let seen_at = wallet
@@ -2968,11 +2989,7 @@ fn replace_tx() {
         .last_seen_unconfirmed
         .unwrap_or_default();
 
-    // tx 1 in, 2 out
-    // 2 unspent 42k, 8k
-
-    // replace tx
-    // find our input from txid0
+    // replace tx1 with tx2
     let addr = wallet.reveal_next_address(KeychainKind::External);
     let mut builder = wallet.replace_tx(txid).unwrap();
     builder
@@ -2982,20 +2999,16 @@ fn replace_tx() {
     let finalized = wallet.sign(&mut psbt, SignOptions::default()).unwrap();
     assert!(finalized);
     let tx = psbt.extract_tx().unwrap();
-    let txid = tx.compute_txid();
-    // dbg!(&txid);
+    let txid2 = tx.compute_txid();
     insert_tx(&mut wallet, tx);
     // make sure this conflict has a higher last seen
-    insert_seen_at(&mut wallet, txid, seen_at + 1);
+    insert_seen_at(&mut wallet, txid2, seen_at + 1);
 
-    // new tx 1 in, 2 out
-    // unspent
+    // unspents should include the outputs of tx2
     let unspent: Vec<_> = wallet.list_unspent().collect();
     assert_eq!(unspent.len(), 2);
-    // dbg!(&unspent);
     for utxo in unspent {
-        // FIXME: this randomly fails
-        assert_eq!(utxo.outpoint.txid, txid);
+        assert_eq!(utxo.outpoint.txid, txid2);
     }
 }
 

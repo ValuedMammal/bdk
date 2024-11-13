@@ -43,6 +43,30 @@ impl fmt::Display for MiniscriptPsbtError {
 #[cfg(feature = "std")]
 impl std::error::Error for MiniscriptPsbtError {}
 
+/// Error returned by [`Wallet::replace_tx`](crate::Wallet::replace_tx).
+#[derive(Debug)]
+pub enum ReplaceTxError {
+    /// did not find transaction in tx graph
+    MissingTransaction,
+    /// tx is confirmed so cannot be replaced
+    TransactionConfirmed,
+    /// did not find local owned output
+    MissingOutput,
+}
+
+impl fmt::Display for ReplaceTxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTransaction => write!(f, "transaction not found in tx graph"),
+            Self::TransactionConfirmed => write!(f, "tx not replaceable: already confirmed"),
+            Self::MissingOutput => write!(f, "could not locate an owned output"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ReplaceTxError {}
+
 #[derive(Debug)]
 /// Error returned from [`TxBuilder::finish`]
 ///

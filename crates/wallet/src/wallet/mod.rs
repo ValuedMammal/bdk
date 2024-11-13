@@ -754,7 +754,8 @@ impl Wallet {
     pub fn replace_tx(
         &mut self,
         txid: Txid,
-    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, &'static str> {
+    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, crate::wallet::error::ReplaceTxError>
+    {
         self.replace_tx_input(txid, None)
     }
 
@@ -769,11 +770,13 @@ impl Wallet {
         &mut self,
         txid: Txid,
         input_index: Option<usize>,
-    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, &'static str> {
-        let tx = match self.get_tx(txid) {
-            Some(tx) => tx.tx_node,
-            None => return Err("tx not found"),
-        };
+    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, crate::wallet::error::ReplaceTxError>
+    {
+        use error::ReplaceTxError;
+        let tx = self
+            .get_tx(txid)
+            .ok_or(ReplaceTxError::MissingTransaction)?
+            .tx_node;
 
         // check tx is not confirmed
         let chain_tip = self.latest_checkpoint().block_id();
@@ -781,7 +784,7 @@ impl Wallet {
             self.tx_graph()
                 .get_chain_position(&self.chain, chain_tip, tx.txid)
         {
-            return Err("tx already confirmed");
+            return Err(ReplaceTxError::TransactionConfirmed);
         }
 
         // get original tx fee/feerate
@@ -807,7 +810,6 @@ impl Wallet {
         };
 
         match input {
-            None => Err("tx is not replaceable: no owned inputs"),
             Some(input) => {
                 let prevout = input.previous_output;
                 let params = TxParams {
@@ -818,9 +820,10 @@ impl Wallet {
                 builder.params = params;
                 builder
                     .add_output(prevout)
-                    .map_err(|_| "failed to add wallet output")?;
+                    .map_err(|_| ReplaceTxError::MissingOutput)?;
                 Ok(builder)
             }
+            None => Err(ReplaceTxError::MissingOutput),
         }
     }
 
@@ -1546,16 +1549,43 @@ impl Wallet {
         let (required_utxos, optional_utxos) =
             coin_selection::filter_duplicates(required_utxos, optional_utxos);
 
-        let coin_selection = coin_selection
-            .coin_select(
-                required_utxos.clone(),
-                optional_utxos.clone(),
-                fee_rate,
-                outgoing.to_sat() + fee_amount.to_sat(),
-                &drain_script,
-                rng,
-            )
-            .map_err(CreateTxError::CoinSelection)?;
+        let mut target = (outgoing + fee_amount).to_sat();
+        let mut res = coin_selection.coin_select(
+            required_utxos.clone(),
+            optional_utxos.clone(),
+            fee_rate,
+            target,
+            &drain_script,
+            rng,
+        );
+        if let Err(InsufficientFunds { needed, available }) = res {
+            if let Some(ref recip) = params.allow_shrinking {
+                // shrink the target and try again
+                let to_shrink = needed - available;
+                let txout = tx
+                    .output
+                    .iter_mut()
+                    .filter(|txout| txout.value.to_sat() >= to_shrink)
+                    .find(|txout| txout.script_pubkey == *recip)
+                    .ok_or(CreateTxError::CoinSelection(InsufficientFunds {
+                        needed,
+                        available,
+                    }))?;
+                txout.value -= Amount::from_sat(to_shrink);
+                target -= to_shrink;
+                res = coin_selection.coin_select(
+                    required_utxos,
+                    optional_utxos,
+                    fee_rate,
+                    target,
+                    &drain_script,
+                    rng,
+                );
+            }
+        }
+
+        let coin_selection = res.map_err(CreateTxError::CoinSelection)?;
+
         fee_amount += Amount::from_sat(coin_selection.fee_amount);
         let excess = &coin_selection.excess;
 

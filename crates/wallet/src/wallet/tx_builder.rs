@@ -141,6 +141,7 @@ pub(crate) struct TxParams {
     pub(crate) bumping_fee: Option<PreviousFee>,
     pub(crate) current_height: Option<absolute::LockTime>,
     pub(crate) allow_dust: bool,
+    pub(crate) allow_shrinking: Option<ScriptBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +174,12 @@ impl<'a, Cs: Clone> Clone for TxBuilder<'a, Cs> {
 
 // Methods supported for any CoinSelectionAlgorithm.
 impl<'a, Cs> TxBuilder<'a, Cs> {
+    /// Allow shrinking a recipient output in order to cover fees
+    pub fn allow_shrinking(&mut self, recip: ScriptBuf) -> &mut Self {
+        self.params.allow_shrinking = Some(recip);
+        self
+    }
+
     /// Set a custom fee rate.
     ///
     /// This method sets the mining fee paid by the transaction as a rate on its size.
@@ -317,16 +324,16 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
         self.add_utxos(&[outpoint])
     }
 
-    /// Add a wallet output. This is useful for creating replacement transactions where the
-    /// output of the given `outpoint` may have been spent, in which case using `add_utxo`
-    /// would not make sense.
-    pub fn add_output(&mut self, outpoint: OutPoint) -> Result<&mut Self, &'static str> {
+    /// Add a wallet owned output.
+    ///
+    /// This is useful for creating replacement transactions where the output of the given
+    /// `outpoint` may have been spent, in which case using `add_utxo` would not make sense.
+    pub(crate) fn add_output(&mut self, outpoint: OutPoint) -> Result<&mut Self, AddOutputError> {
         {
             let wallet = self.wallet.borrow();
-            let output = match wallet.get_output(outpoint) {
-                Some(output) => output,
-                None => return Err("output not found"),
-            };
+            let output = wallet
+                .get_output(outpoint)
+                .ok_or(AddOutputError(outpoint))?;
             let desc = wallet.public_descriptor(output.keychain);
             let satisfaction_weight = desc
                 .max_weight_to_satisfy()
@@ -732,6 +739,22 @@ impl fmt::Display for AddUtxoError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for AddUtxoError {}
+
+#[derive(Debug)]
+/// Error returned from [`TxBuilder::add_output`]
+pub struct AddOutputError(
+    /// the missing outpoint
+    pub OutPoint,
+);
+
+impl fmt::Display for AddOutputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no output found for outpoint {}", self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for AddOutputError {}
 
 #[derive(Debug)]
 /// Error returned from [`TxBuilder::add_foreign_utxo`].
