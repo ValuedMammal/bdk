@@ -737,6 +737,93 @@ impl Wallet {
         })
     }
 
+    /// Replace tx
+    ///
+    /// For this to work we have to choose an input and use it to create another tx
+    /// This returns a new [`TxBuilder`] populated with the input to spend that is
+    /// taken from the original tx along with fee information of the original tx.
+    ///
+    /// Contract:
+    /// - returns a new TxBuilder
+    /// - assume the tx in graph and is canonical, in other words it is returned by `transactions`
+    /// - it must not have any anchors in best chain
+    /// - it must have an input that "is mine"
+    /// - the input to be replaced is the first one we find that is ours
+    /// - besides the replaced input and the required fee implied by the original tx,
+    ///     we make no assumptions on the structure of the replacement tx
+    pub fn replace_tx(
+        &mut self,
+        txid: Txid,
+    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, &'static str> {
+        self.replace_tx_input(txid, None)
+    }
+
+    /// Replace the transaction with `txid` by double-spending the input at the given `input_index`.
+    ///
+    /// See also [`Wallet::replace_tx`].
+    ///
+    /// - `input_index`: Optional index of the tx input to replace. This will be added to the
+    ///     returned tx builder. If none, we look for the first input for which `is_mine` is
+    ///     `true`
+    pub fn replace_tx_input(
+        &mut self,
+        txid: Txid,
+        input_index: Option<usize>,
+    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, &'static str> {
+        let tx = match self.get_tx(txid) {
+            Some(tx) => tx.tx_node,
+            None => return Err("tx not found"),
+        };
+
+        // check tx is not confirmed
+        let chain_tip = self.latest_checkpoint().block_id();
+        if let Some(ChainPosition::Confirmed(_)) =
+            self.tx_graph()
+                .get_chain_position(&self.chain, chain_tip, tx.txid)
+        {
+            return Err("tx already confirmed");
+        }
+
+        // get original tx fee/feerate
+        let previous_fee = self.calculate_fee(&tx.tx).ok().map(|fee| {
+            let feerate = fee / tx.weight();
+            use tx_builder::PreviousFee;
+            PreviousFee {
+                absolute: fee,
+                rate: feerate,
+            }
+        });
+
+        // find our input
+        let input = if let Some(i) = input_index {
+            tx.input.get(i)
+        } else {
+            tx.input.iter().find(|txin| {
+                matches!(
+                    self.tx_graph().get_txout(txin.previous_output),
+                    Some(txout) if self.is_mine(txout.script_pubkey.clone()),
+                )
+            })
+        };
+
+        match input {
+            None => Err("tx is not replaceable: no owned inputs"),
+            Some(input) => {
+                let prevout = input.previous_output;
+                let params = TxParams {
+                    bumping_fee: previous_fee,
+                    ..Default::default()
+                };
+                let mut builder = Self::build_tx(self);
+                builder.params = params;
+                builder
+                    .add_output(prevout)
+                    .map_err(|_| "failed to add wallet output")?;
+                Ok(builder)
+            }
+        }
+    }
+
     /// Get the next unused address for the given `keychain`, i.e. the address with the lowest
     /// derivation index that hasn't been used.
     ///
@@ -890,6 +977,22 @@ impl Wallet {
                 &self.chain,
                 self.chain.tip().block_id(),
                 core::iter::once(((), op)),
+            )
+            .map(|(_, full_txo)| new_local_utxo(keychain, index, full_txo))
+            .next()
+    }
+
+    /// Get a local output. A local output is an output owned by this wallet and indexed
+    /// internally. This method can be used to reproduce an output that may have been
+    /// spent but is eligible to be used in a replacement transaction.
+    fn get_output(&self, outpoint: OutPoint) -> Option<LocalOutput> {
+        let ((keychain, index), _) = self.indexed_graph.index.txout(outpoint)?;
+        self.indexed_graph
+            .graph()
+            .filter_chain_txouts(
+                &self.chain,
+                self.chain.tip().block_id(),
+                core::iter::once(((), outpoint)),
             )
             .map(|(_, full_txo)| new_local_utxo(keychain, index, full_txo))
             .next()

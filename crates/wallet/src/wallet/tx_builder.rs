@@ -317,6 +317,29 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
         self.add_utxos(&[outpoint])
     }
 
+    /// Add a wallet output. This is useful for creating replacement transactions where the
+    /// output of the given `outpoint` may have been spent, in which case using `add_utxo`
+    /// would not make sense.
+    pub fn add_output(&mut self, outpoint: OutPoint) -> Result<&mut Self, &'static str> {
+        {
+            let wallet = self.wallet.borrow();
+            let output = match wallet.get_output(outpoint) {
+                Some(output) => output,
+                None => return Err("output not found"),
+            };
+            let desc = wallet.public_descriptor(output.keychain);
+            let satisfaction_weight = desc
+                .max_weight_to_satisfy()
+                .expect("descriptor should be satisfiable");
+            self.params.utxos.push(WeightedUtxo {
+                satisfaction_weight,
+                utxo: Utxo::Local(output),
+            });
+        }
+
+        Ok(self)
+    }
+
     /// Add a foreign UTXO i.e. a UTXO not owned by this wallet.
     ///
     /// At a minimum to add a foreign UTXO we need:

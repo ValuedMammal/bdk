@@ -2942,6 +2942,64 @@ fn test_unused_address() {
 }
 
 #[test]
+#[allow(unused)]
+fn replace_tx() {
+    let (mut wallet, txid0) = get_funded_wallet_wpkh();
+    assert_eq!(wallet.balance().total().to_sat(), 50_000);
+    let addr = wallet.reveal_next_address(KeychainKind::External);
+
+    // dbg!(txid0);
+    // 1 unspent 50k
+
+    let mut builder = wallet.build_tx();
+    builder.add_recipient(addr.script_pubkey(), Amount::from_sat(42_000));
+    let mut psbt = builder.finish().unwrap();
+    let finalized = wallet.sign(&mut psbt, SignOptions::default()).unwrap();
+    assert!(finalized);
+    let tx = psbt.extract_tx().unwrap();
+    let feerate = wallet.calculate_fee_rate(&tx).unwrap().to_sat_per_kwu();
+    // dbg!(&tx);
+    let txid = tx.compute_txid();
+    insert_tx(&mut wallet, tx);
+    let seen_at = wallet
+        .tx_graph()
+        .get_tx_node(txid)
+        .unwrap()
+        .last_seen_unconfirmed
+        .unwrap_or_default();
+
+    // tx 1 in, 2 out
+    // 2 unspent 42k, 8k
+
+    // replace tx
+    // find our input from txid0
+    let addr = wallet.reveal_next_address(KeychainKind::External);
+    let mut builder = wallet.replace_tx(txid).unwrap();
+    builder
+        .fee_rate(FeeRate::from_sat_per_kwu(feerate + 250))
+        .add_recipient(addr.script_pubkey(), Amount::from_sat(41_000));
+    let mut psbt = builder.finish().unwrap();
+    let finalized = wallet.sign(&mut psbt, SignOptions::default()).unwrap();
+    assert!(finalized);
+    let tx = psbt.extract_tx().unwrap();
+    let txid = tx.compute_txid();
+    // dbg!(&txid);
+    insert_tx(&mut wallet, tx);
+    // make sure this conflict has a higher last seen
+    insert_seen_at(&mut wallet, txid, seen_at + 1);
+
+    // new tx 1 in, 2 out
+    // unspent
+    let unspent: Vec<_> = wallet.list_unspent().collect();
+    assert_eq!(unspent.len(), 2);
+    // dbg!(&unspent);
+    for utxo in unspent {
+        // FIXME: this randomly fails
+        assert_eq!(utxo.outpoint.txid, txid);
+    }
+}
+
+#[test]
 fn test_next_unused_address() {
     let descriptor = "wpkh(tpubEBr4i6yk5nf5DAaJpsi9N2pPYBeJ7fZ5Z9rmN4977iYLCGco1VyjB9tvvuvYtfZzjD5A8igzgw3HeWeeKFmanHYqksqZXYXGsw5zjnj7KM9/*)";
     let change_descriptor = get_test_wpkh();
