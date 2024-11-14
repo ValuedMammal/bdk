@@ -128,6 +128,11 @@ pub enum CreateTxError {
     MissingNonWitnessUtxo(OutPoint),
     /// Miniscript PSBT error
     MiniscriptPsbt(MiniscriptPsbtError),
+    /// Unable to shrink the output to a recipient
+    AllowShrinking {
+        /// amount needed to shrink
+        needed: Amount,
+    },
 }
 
 impl fmt::Display for CreateTxError {
@@ -194,6 +199,9 @@ impl fmt::Display for CreateTxError {
             }
             CreateTxError::MiniscriptPsbt(err) => {
                 write!(f, "Miniscript PSBT error: {}", err)
+            }
+            CreateTxError::AllowShrinking { needed } => {
+                write!(f, "could not shrink amount of txout; needed: {}", needed)
             }
         }
     }

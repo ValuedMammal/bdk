@@ -2965,7 +2965,7 @@ fn allow_shrinking() {
     let mut builder = wallet.build_tx();
     builder
         .add_recipient(recip.clone(), total_bal)
-        .allow_shrinking(recip);
+        .allow_shrinking(recip.clone());
     let psbt = builder.finish().unwrap();
     let fee = psbt.fee().unwrap();
     assert!(
@@ -2979,7 +2979,23 @@ fn allow_shrinking() {
         "recipient output should shrink"
     );
 
-    // TODO: allow shrinking error
+    // unable to shrink a recipient if the fee shortfall
+    // exceeds the value of the output
+    let recip2 =
+        Address::from_str("bcrt1qj9f7r8r3p2y0sqf4r3r62qysmkuh0fzep473d2ar7rcz64wqvhssjgf0z4")
+            .unwrap()
+            .assume_checked()
+            .script_pubkey();
+    let mut builder = wallet.build_tx();
+    builder
+        .add_recipient(recip, Amount::ONE_BTC)
+        .add_recipient(recip2.clone(), Amount::from_sat(20_000))
+        .allow_shrinking(recip2);
+    let res = builder.finish();
+    assert!(
+        matches!(res, Err(CreateTxError::AllowShrinking { .. })),
+        "cannot shrink more than the total recipient amount",
+    );
 }
 
 #[test]

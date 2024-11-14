@@ -1561,19 +1561,15 @@ impl Wallet {
         if let Err(InsufficientFunds { needed, available }) = res {
             if let Some(ref recip) = params.allow_shrinking {
                 // shrink the target and try again
-                let to_shrink = needed - available;
+                let to_shrink = Amount::from_sat(needed - available);
                 let txout = tx
                     .output
                     .iter_mut()
-                    .filter(|txout| txout.value.to_sat() >= to_shrink)
+                    .filter(|txout| txout.value >= to_shrink)
                     .find(|txout| txout.script_pubkey == *recip)
-                    // TODO: return a more distinct error
-                    .ok_or(CreateTxError::CoinSelection(InsufficientFunds {
-                        needed,
-                        available,
-                    }))?;
-                txout.value -= Amount::from_sat(to_shrink);
-                target -= to_shrink;
+                    .ok_or(CreateTxError::AllowShrinking { needed: to_shrink })?;
+                txout.value -= to_shrink;
+                target -= to_shrink.to_sat();
                 res = coin_selection.coin_select(
                     required_utxos,
                     optional_utxos,
