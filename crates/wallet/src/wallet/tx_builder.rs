@@ -744,7 +744,7 @@ impl fmt::Display for AddUtxoError {
 impl std::error::Error for AddUtxoError {}
 
 #[derive(Debug)]
-/// Error returned from [`TxBuilder::add_output`]
+/// Error returned from `TxBuilder::add_output`
 pub struct AddOutputError(
     /// the missing outpoint
     pub OutPoint,

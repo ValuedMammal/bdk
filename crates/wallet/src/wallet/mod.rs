@@ -73,7 +73,7 @@ use crate::wallet::{
         Excess::{self, Change, NoChange},
         InsufficientFunds,
     },
-    error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError},
+    error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError, ReplaceTxError},
     signer::{SignOptions, SignerError, SignerOrdering, SignersContainer, TransactionSigner},
     tx_builder::{FeePolicy, TxBuilder, TxParams},
     utils::{check_nsequence_rbf, After, Older, SecpCtx},
@@ -737,42 +737,47 @@ impl Wallet {
         })
     }
 
-    /// Replace tx
+    /// Replace an unconfirmed transaction.
     ///
-    /// For this to work we have to choose an input and use it to create another tx
-    /// This returns a new [`TxBuilder`] populated with the input to spend that is
-    /// taken from the original tx along with fee information of the original tx.
+    /// This method returns a new [`TxBuilder`] populated with the input to be spent taken
+    /// from the original tx along with the original fee information used to evaluate the
+    /// replacement in terms of RBF policy rules. In contrast to the related [`build_fee_bump`],
+    /// no other assumptions are made about the structure of the replacement.
     ///
-    /// Contract:
-    /// - returns a new TxBuilder
-    /// - assume the tx in graph and is canonical, in other words it is returned by `transactions`
-    /// - it must not have any anchors in best chain
-    /// - it must have an input that "is mine"
-    /// - the input to be replaced is the first one we find that is ours
-    /// - besides the replaced input and the required fee implied by the original tx,
-    ///     we make no assumptions on the structure of the replacement tx
+    /// The input chosen to be replaced is the first input found whose previous output
+    /// belongs to this wallet. See also [`Wallet::replace_tx_input`] to specify the index
+    /// of the input to replace.
+    ///
+    /// # Errors
+    ///
+    /// If any of the following are true
+    /// - the tx is not found in the tx graph
+    /// - the tx is already confirmed
+    /// - we cannot determine a wallet-owned output
+    ///
+    /// [`build_fee_bump`]: Self::build_fee_bump
     pub fn replace_tx(
         &mut self,
         txid: Txid,
-    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, crate::wallet::error::ReplaceTxError>
-    {
+    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, ReplaceTxError> {
         self.replace_tx_input(txid, None)
     }
 
-    /// Replace the transaction with `txid` by double-spending the input at the given `input_index`.
+    /// Replace the transaction with `txid` by "double-spending" the input at the given
+    /// `input_index`.
     ///
-    /// See also [`Wallet::replace_tx`].
+    /// Refer to [`Wallet::replace_tx`] for more.
     ///
     /// - `input_index`: Optional index of the tx input to replace. This will be added to the
-    ///     returned tx builder. If none, we look for the first input for which `is_mine` is
+    ///     returned tx builder. If `None`, we look for the first input for which [`is_mine`] is
     ///     `true`
+    ///
+    /// [`is_mine`]: Self::is_mine
     pub fn replace_tx_input(
         &mut self,
         txid: Txid,
         input_index: Option<usize>,
-    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, crate::wallet::error::ReplaceTxError>
-    {
-        use error::ReplaceTxError;
+    ) -> Result<TxBuilder<'_, DefaultCoinSelectionAlgorithm>, ReplaceTxError> {
         let tx = self
             .get_tx(txid)
             .ok_or(ReplaceTxError::MissingTransaction)?
@@ -1560,7 +1565,7 @@ impl Wallet {
         );
         if let Err(InsufficientFunds { needed, available }) = res {
             if let Some(ref recip) = params.allow_shrinking {
-                // shrink the target and try again
+                // shrink the target and try selection again
                 let to_shrink = Amount::from_sat(needed - available);
                 let txout = tx
                     .output
