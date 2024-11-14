@@ -2942,28 +2942,44 @@ fn test_unused_address() {
 }
 
 #[test]
-#[allow(unused)]
 fn allow_shrinking() {
-    // 1 in 1 out
-    // shrink the 1 output
-
-    // 1 in 2 out
-    // shrink the larger output by a max of
-
+    use bdk_wallet::coin_selection::InsufficientFunds;
     let (mut wallet, _) = get_funded_wallet_wpkh();
-    let amount = wallet.balance().total();
-    let fee = Amount::from_sat(200);
-    let addr = wallet.next_unused_address(KeychainKind::External);
-    let addr2 = wallet.next_unused_address(KeychainKind::External);
+    let total_bal = wallet.balance().total();
+    let recip = wallet
+        .next_unused_address(KeychainKind::External)
+        .script_pubkey();
 
+    // sending all without fees should error
+    let mut builder = wallet.build_tx();
+    builder.add_recipient(recip.clone(), total_bal);
+    let err = builder.finish().unwrap_err();
+    assert!(matches!(err, CreateTxError::CoinSelection(_)));
+
+    let mut shrink_amount = 0;
+    if let CreateTxError::CoinSelection(InsufficientFunds { needed, available }) = err {
+        shrink_amount = needed - available;
+    }
+
+    // now allow shrinking the recipient output
     let mut builder = wallet.build_tx();
     builder
-        .add_recipient(addr.script_pubkey(), Amount::from_sat(30_000))
-        .add_recipient(addr2.script_pubkey(), Amount::from_sat(20_000));
-    let mut psbt = builder.finish().unwrap();
-    wallet.sign(&mut psbt, SignOptions::default()).unwrap();
-    let tx = psbt.extract_tx().unwrap();
-    dbg!(&tx.output);
+        .add_recipient(recip.clone(), total_bal)
+        .allow_shrinking(recip);
+    let psbt = builder.finish().unwrap();
+    let fee = psbt.fee().unwrap();
+    assert!(
+        shrink_amount <= fee.to_sat(),
+        "shrink amount should not exceed tx fee"
+    );
+    assert_eq!(psbt.unsigned_tx.output.len(), 1);
+    assert_eq!(
+        psbt.unsigned_tx.output[0].value.to_sat(),
+        total_bal.to_sat() - shrink_amount,
+        "recipient output should shrink"
+    );
+
+    // TODO: allow shrinking error
 }
 
 #[test]

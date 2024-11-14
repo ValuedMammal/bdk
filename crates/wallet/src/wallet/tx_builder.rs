@@ -174,7 +174,10 @@ impl<'a, Cs: Clone> Clone for TxBuilder<'a, Cs> {
 
 // Methods supported for any CoinSelectionAlgorithm.
 impl<'a, Cs> TxBuilder<'a, Cs> {
-    /// Allow shrinking a recipient output in order to cover fees
+    /// Allow shrinking a recipient output in order to cover fees.
+    ///
+    /// To succeed the recipient must be found in the list of recipients and have a
+    /// value large enough to shrink by the amount of the fee shortfall.
     pub fn allow_shrinking(&mut self, recip: ScriptBuf) -> &mut Self {
         self.params.allow_shrinking = Some(recip);
         self

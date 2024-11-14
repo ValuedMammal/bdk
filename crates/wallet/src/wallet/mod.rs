@@ -1567,6 +1567,7 @@ impl Wallet {
                     .iter_mut()
                     .filter(|txout| txout.value.to_sat() >= to_shrink)
                     .find(|txout| txout.script_pubkey == *recip)
+                    // TODO: return a more distinct error
                     .ok_or(CreateTxError::CoinSelection(InsufficientFunds {
                         needed,
                         available,
@@ -1583,7 +1584,6 @@ impl Wallet {
                 );
             }
         }
-
         let coin_selection = res.map_err(CreateTxError::CoinSelection)?;
 
         fee_amount += Amount::from_sat(coin_selection.fee_amount);
