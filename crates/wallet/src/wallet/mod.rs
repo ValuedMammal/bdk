@@ -69,11 +69,7 @@ use crate::descriptor::{
 use crate::psbt::PsbtUtils;
 use crate::types::*;
 use crate::wallet::{
-    coin_selection::{
-        DefaultCoinSelectionAlgorithm,
-        Excess::{self, Change, NoChange},
-        InsufficientFunds,
-    },
+    coin_selection::{DefaultCoinSelectionAlgorithm, Excess, InsufficientFunds},
     error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError, PlanError},
     signer::{SignOptions, SignerError, SignerOrdering, SignersContainer, TransactionSigner},
     tx_builder::{FeePolicy, TxBuilder, TxParams},
@@ -1489,7 +1485,7 @@ impl Wallet {
                 rng,
             )
             .map_err(CreateTxError::CoinSelection)?;
-        fee_amount += Amount::from_sat(coin_selection.fee_amount);
+
         let excess = &coin_selection.excess;
 
         tx.input = coin_selection
@@ -1512,7 +1508,7 @@ impl Wallet {
             // Otherwise, we don't know who we should send the funds to, and how much
             // we should send!
             if params.drain_to.is_some() && (params.drain_wallet || !params.utxos.is_empty()) {
-                if let NoChange {
+                if let Excess::NoChange {
                     dust_threshold,
                     remaining_amount,
                     change_fee,
@@ -1528,28 +1524,18 @@ impl Wallet {
             }
         }
 
-        match excess {
-            NoChange {
-                remaining_amount, ..
-            } => fee_amount += Amount::from_sat(*remaining_amount),
-            Change { amount, fee } => {
-                if self.is_mine(drain_script.clone()) {
-                    received += Amount::from_sat(*amount);
-                }
-                fee_amount += Amount::from_sat(*fee);
+        if let Excess::Change { amount, .. } = excess {
+            // create drain output
+            let drain_output = TxOut {
+                value: Amount::from_sat(*amount),
+                script_pubkey: drain_script,
+            };
 
-                // create drain output
-                let drain_output = TxOut {
-                    value: Amount::from_sat(*amount),
-                    script_pubkey: drain_script,
-                };
-
-                // TODO: We should pay attention when adding a new output: this might increase
-                // the length of the "number of vouts" parameter by 2 bytes, potentially making
-                // our feerate too low
-                tx.output.push(drain_output);
-            }
-        };
+            // TODO: We should pay attention when adding a new output: this might increase
+            // the length of the "number of vouts" parameter by 2 bytes, potentially making
+            // our feerate too low
+            tx.output.push(drain_output);
+        }
 
         // sort input/outputs according to the chosen algorithm
         params.ordering.sort_tx_with_aux_rand(&mut tx, rng);
@@ -1793,7 +1779,7 @@ impl Wallet {
 
         // attempt to finalize
         if sign_options.try_finalize {
-            self.finalize_psbt(psbt, sign_options)
+            self.finalize_psbt(psbt)
         } else {
             Ok(false)
         }
@@ -1836,11 +1822,7 @@ impl Wallet {
     /// Returns `true` if the PSBT could be finalized, and `false` otherwise.
     ///
     /// The [`SignOptions`] can be used to tweak the behavior of the finalizer.
-    pub fn finalize_psbt(
-        &self,
-        psbt: &mut Psbt,
-        _sign_options: SignOptions,
-    ) -> Result<bool, SignerError> {
+    pub fn finalize_psbt(&self, psbt: &mut Psbt) -> Result<bool, SignerError> {
         let tx = &psbt.unsigned_tx;
         let mut finished = true;
 
