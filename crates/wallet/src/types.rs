@@ -15,6 +15,7 @@ use core::convert::AsRef;
 
 use bitcoin::transaction::{OutPoint, Sequence, TxOut};
 use bitcoin::{psbt, Weight};
+use miniscript::plan::Plan;
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +76,31 @@ pub struct WeightedUtxo {
     pub satisfaction_weight: Weight,
     /// The UTXO
     pub utxo: Utxo,
+}
+
+/// A [`Utxo`] and accompanying [`Plan`]
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedUtxo {
+    /// plan
+    pub plan: Plan,
+    /// utxo
+    pub utxo: Utxo,
+}
+
+impl PlannedUtxo {
+    /// Create new [`PlannedUtxo`]
+    pub fn new(plan: Plan, utxo: Utxo) -> Self {
+        Self { plan, utxo }
+    }
+
+    /// Get a weighted utxo
+    pub fn weighted_utxo(&self) -> WeightedUtxo {
+        let wu = self.plan.satisfaction_weight();
+        WeightedUtxo {
+            satisfaction_weight: Weight::from_wu_usize(wu),
+            utxo: self.utxo.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

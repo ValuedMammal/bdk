@@ -444,17 +444,7 @@ pub struct Policy {
     pub contribution: Satisfaction,
 }
 
-/// An extra condition that must be satisfied but that is out of control of the user
-/// TODO: use `bitcoin::LockTime` and `bitcoin::Sequence`
-#[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Default, Serialize)]
-pub struct Condition {
-    /// Optional CheckSequenceVerify condition
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub csv: Option<Sequence>,
-    /// Optional timelock condition
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timelock: Option<absolute::LockTime>,
-}
+use crate::utils::Condition;
 
 impl Condition {
     fn merge_nlocktime(
@@ -478,7 +468,7 @@ impl Condition {
         }
     }
 
-    pub(crate) fn merge(mut self, other: &Condition) -> Result<Self, PolicyError> {
+    fn merge(mut self, other: &Condition) -> Result<Self, PolicyError> {
         match (self.csv, other.csv) {
             (Some(a), Some(b)) => self.csv = Some(Self::merge_nsequence(a, b)?),
             (None, any) => self.csv = any,

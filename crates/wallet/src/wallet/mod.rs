@@ -37,7 +37,7 @@ use bitcoin::{
     absolute,
     consensus::encode::serialize,
     constants::{genesis_block, COINBASE_MATURITY},
-    psbt,
+    psbt, relative,
     secp256k1::Secp256k1,
     sighash::{EcdsaSighashType, TapSighashType},
     transaction, Address, Amount, Block, BlockHash, FeeRate, Network, OutPoint, Psbt, ScriptBuf,
@@ -45,7 +45,9 @@ use bitcoin::{
 };
 use miniscript::{
     descriptor::KeyMap,
+    plan::{Assets, Plan},
     psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier},
+    ForEachKey,
 };
 use rand_core::RngCore;
 
@@ -59,11 +61,10 @@ pub mod signer;
 pub mod tx_builder;
 pub(crate) mod utils;
 
-use crate::collections::{BTreeMap, HashMap};
+use crate::collections::{BTreeMap, HashMap, HashSet};
 use crate::descriptor::{
-    check_wallet_descriptor, error::Error as DescriptorError, policy::BuildSatisfaction,
-    DerivedDescriptor, DescriptorMeta, ExtendedDescriptor, ExtractPolicy, IntoWalletDescriptor,
-    Policy, XKeyUtils,
+    check_wallet_descriptor, error::Error as DescriptorError, DerivedDescriptor, DescriptorMeta,
+    ExtendedDescriptor, IntoWalletDescriptor, Policy, XKeyUtils,
 };
 use crate::psbt::PsbtUtils;
 use crate::types::*;
@@ -73,10 +74,10 @@ use crate::wallet::{
         Excess::{self, Change, NoChange},
         InsufficientFunds,
     },
-    error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError},
+    error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError, PlanError},
     signer::{SignOptions, SignerError, SignerOrdering, SignersContainer, TransactionSigner},
     tx_builder::{FeePolicy, TxBuilder, TxParams},
-    utils::{check_nsequence_rbf, After, Older, SecpCtx},
+    utils::{check_nsequence_rbf, AssetsExt, Condition, SecpCtx},
 };
 
 // re-exports
@@ -1217,65 +1218,63 @@ impl Wallet {
         params: TxParams,
         rng: &mut impl RngCore,
     ) -> Result<Psbt, CreateTxError> {
-        let keychains: BTreeMap<_, _> = self.indexed_graph.index.keychains().collect();
-        let external_descriptor = keychains.get(&KeychainKind::External).expect("must exist");
-        let internal_descriptor = keychains.get(&KeychainKind::Internal);
-
-        let external_policy = external_descriptor
-            .extract_policy(&self.signers, BuildSatisfaction::None, &self.secp)?
-            .unwrap();
-        let internal_policy = internal_descriptor
-            .map(|desc| {
-                Ok::<_, CreateTxError>(
-                    desc.extract_policy(&self.change_signers, BuildSatisfaction::None, &self.secp)?
-                        .unwrap(),
-                )
-            })
-            .transpose()?;
-
-        // The policy allows spending external outputs, but it requires a policy path that hasn't been
-        // provided
-        if params.change_policy != tx_builder::ChangeSpendPolicy::OnlyChange
-            && external_policy.requires_path()
-            && params.external_policy_path.is_none()
-        {
-            return Err(CreateTxError::SpendingPolicyRequired(
-                KeychainKind::External,
-            ));
+        // get spend assets
+        let assets = match params.assets {
+            None => self.assets(),
+            Some(ref params) => {
+                let mut assets = Assets::new();
+                assets
+                    .extend(params)
+                    .expect("extending a new Assets should not fail");
+                assets
+            }
         };
-        // Same for the internal_policy path
-        if let Some(internal_policy) = &internal_policy {
-            if params.change_policy != tx_builder::ChangeSpendPolicy::ChangeForbidden
-                && internal_policy.requires_path()
-                && params.internal_policy_path.is_none()
-            {
-                return Err(CreateTxError::SpendingPolicyRequired(
-                    KeychainKind::Internal,
-                ));
-            };
-        }
 
-        let external_requirements = external_policy.get_condition(
-            params
-                .external_policy_path
-                .as_ref()
-                .unwrap_or(&BTreeMap::new()),
-        )?;
-        let internal_requirements = internal_policy
-            .map(|policy| {
-                Ok::<_, CreateTxError>(
-                    policy.get_condition(
-                        params
-                            .internal_policy_path
-                            .as_ref()
-                            .unwrap_or(&BTreeMap::new()),
-                    )?,
-                )
+        // get planned utxos
+        let manually_selected: HashSet<OutPoint> = params.utxos.clone().into_iter().collect();
+        let picked = manually_selected
+            .iter()
+            .flat_map(|outpoint| {
+                self.get_utxo(*outpoint)
+                    .map(|output| self.try_plan(output, &assets))
             })
-            .transpose()?;
+            .collect::<Vec<Result<_, _>>>();
 
-        let requirements =
-            external_requirements.merge(&internal_requirements.unwrap_or_default())?;
+        let avail = self
+            .list_unspent()
+            .filter(|utxo| !manually_selected.contains(&utxo.outpoint))
+            .map(|utxo| self.try_plan(utxo, &assets))
+            .collect::<Vec<Result<_, _>>>();
+
+        // We may have coins to spend but were unable to create any plans. This
+        // can happen if the known or provided assets are insufficient.
+        if !picked.iter().chain(&avail).any(|res| res.is_ok()) {
+            while let Some(res) = picked.iter().chain(&avail).next().cloned() {
+                let _ = res.map_err(CreateTxError::Plan)?;
+            }
+        }
+        let must_spend: Vec<PlannedUtxo> = picked
+            .into_iter()
+            .flat_map(|res| res.ok().map(|(plan, utxo)| PlannedUtxo::new(plan, utxo)))
+            .collect();
+        let may_spend: Vec<PlannedUtxo> = avail
+            .into_iter()
+            .flat_map(|res| res.ok().map(|(plan, utxo)| PlannedUtxo::new(plan, utxo)))
+            .collect();
+
+        // accumulate the max required locktimes
+        let requirements = must_spend
+            .iter()
+            .chain(&may_spend)
+            .try_fold(Condition::default(), |req, plan_utxo| {
+                let PlannedUtxo { plan, .. } = plan_utxo;
+                let cond = Condition {
+                    timelock: plan.absolute_timelock,
+                    csv: plan.relative_timelock.map(|lt| lt.to_sequence()),
+                };
+                req.merge_condition(cond)
+            })
+            .map_err(CreateTxError::Plan)?;
 
         let version = match params.version {
             Some(tx_builder::Version(0)) => return Err(CreateTxError::Version0),
@@ -1287,15 +1286,12 @@ impl Wallet {
             None => 1,
         };
 
-        // We use a match here instead of a unwrap_or_else as it's way more readable :)
-        let current_height = match params.current_height {
-            // If they didn't tell us the current height, we assume it's the latest sync height.
-            None => {
-                let tip_height = self.chain.tip().height();
-                absolute::LockTime::from_height(tip_height).expect("invalid height")
-            }
-            Some(h) => h,
-        };
+        let current_height: absolute::LockTime =
+            assets
+                .absolute_timelock
+                .unwrap_or(absolute::LockTime::from_consensus(
+                    self.latest_checkpoint().height(),
+                ));
 
         let lock_time = match params.locktime {
             // When no nLockTime is specified, we try to prevent fee sniping, if possible
@@ -1421,26 +1417,40 @@ impl Wallet {
 
         fee_amount += fee_rate * tx.weight();
 
-        let must_spend: Vec<_> = params
-            .utxos
-            .iter()
-            .flat_map(|outpoint| {
-                self.get_utxo(*outpoint).map(|output| {
-                    let desc = self.public_descriptor(output.keychain);
-                    let satisfaction_weight = desc
-                        .max_weight_to_satisfy()
-                        .expect("descriptor should be satisfiable");
-                    WeightedUtxo {
-                        utxo: Utxo::Local(output),
-                        satisfaction_weight,
-                    }
-                })
-            })
-            .chain(params.foreign_utxos.clone())
+        let must_spend: Vec<WeightedUtxo> = must_spend
+            .into_iter()
+            .map(|p| p.weighted_utxo())
+            .chain(
+                params
+                    .foreign_utxos
+                    .clone()
+                    .into_iter()
+                    .filter(|u| !manually_selected.contains(&u.utxo.outpoint())),
+            )
             .collect();
 
+        let may_spend: Vec<(LocalOutput, Weight)> = may_spend
+            .into_iter()
+            .flat_map(|p| {
+                let weighted_utxo = p.weighted_utxo();
+                let weight = weighted_utxo.satisfaction_weight;
+                if let Utxo::Local(output) = weighted_utxo.utxo {
+                    Some((output, weight))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let (required_utxos, optional_utxos) = self.preselect_utxos(
+            must_spend,
+            may_spend,
+            &params,
+            current_height.to_consensus_u32(),
+        );
+
         let (required_utxos, optional_utxos) =
-            self.preselect_utxos(must_spend, &params, Some(current_height.to_consensus_u32()));
+            coin_selection::filter_duplicates(required_utxos, optional_utxos);
 
         // get drain script
         let mut drain_index = Option::<(KeychainKind, u32)>::None;
@@ -1469,13 +1479,10 @@ impl Wallet {
             }
         };
 
-        let (required_utxos, optional_utxos) =
-            coin_selection::filter_duplicates(required_utxos, optional_utxos);
-
         let coin_selection = coin_selection
             .coin_select(
-                required_utxos.clone(),
-                optional_utxos.clone(),
+                required_utxos,
+                optional_utxos,
                 fee_rate,
                 outgoing.to_sat() + fee_amount.to_sat(),
                 &drain_script,
@@ -1551,13 +1558,12 @@ impl Wallet {
 
         // recording changes to the change keychain
         if let (Excess::Change { .. }, Some((keychain, index))) = (excess, drain_index) {
-            let (_, index_changeset) = self
-                .indexed_graph
-                .index
-                .reveal_to_target(keychain, index)
-                .expect("must not be None");
-            self.stage.merge(index_changeset.into());
-            self.mark_used(keychain, index);
+            if let Some((_, index_changeset)) =
+                self.indexed_graph.index.reveal_to_target(keychain, index)
+            {
+                self.stage.merge(index_changeset.into());
+                self.mark_used(keychain, index);
+            }
         }
 
         Ok(psbt)
@@ -1644,7 +1650,8 @@ impl Wallet {
 
         // remove the inputs from the tx and process them
         let original_txin = tx.input.drain(..).collect::<Vec<_>>();
-        let original_utxos = original_txin
+
+        let weighted_utxos = original_txin
             .iter()
             .map(|txin| -> Result<_, BuildFeeBumpError> {
                 let prev_tx = graph
@@ -1681,7 +1688,7 @@ impl Wallet {
         if tx.output.len() > 1 {
             let mut change_index = None;
             for (index, txout) in tx.output.iter().enumerate() {
-                let change_keychain = KeychainKind::Internal;
+                let change_keychain = self.map_keychain(KeychainKind::Internal);
                 match txout_index.index_of_spk(txout.script_pubkey.clone()) {
                     Some((keychain, _)) if *keychain == change_keychain => {
                         change_index = Some(index)
@@ -1689,21 +1696,19 @@ impl Wallet {
                     _ => {}
                 }
             }
-
             if let Some(change_index) = change_index {
                 tx.output.remove(change_index);
             }
         }
 
         let params = TxParams {
-            // TODO: figure out what rbf option should be?
             version: Some(tx_builder::Version(tx.version.0)),
             recipients: tx
                 .output
                 .into_iter()
                 .map(|txout| (txout.script_pubkey, txout.value))
                 .collect(),
-            foreign_utxos: original_utxos,
+            foreign_utxos: weighted_utxos,
             bumping_fee: Some(tx_builder::PreviousFee {
                 absolute: fee,
                 rate: fee_rate,
@@ -1796,6 +1801,8 @@ impl Wallet {
 
     /// Return the spending policies for the wallet's descriptor
     pub fn policies(&self, keychain: KeychainKind) -> Result<Option<Policy>, DescriptorError> {
+        use crate::descriptor::{policy::BuildSatisfaction, ExtractPolicy};
+
         let signers = match keychain {
             KeychainKind::External => &self.signers,
             KeychainKind::Internal => &self.change_signers,
@@ -1832,14 +1839,12 @@ impl Wallet {
     pub fn finalize_psbt(
         &self,
         psbt: &mut Psbt,
-        sign_options: SignOptions,
+        _sign_options: SignOptions,
     ) -> Result<bool, SignerError> {
-        let chain_tip = self.chain.tip().block_id();
-
         let tx = &psbt.unsigned_tx;
         let mut finished = true;
 
-        for (n, input) in tx.input.iter().enumerate() {
+        for (n, _input) in tx.input.iter().enumerate() {
             let psbt_input = &psbt
                 .inputs
                 .get(n)
@@ -1847,18 +1852,6 @@ impl Wallet {
             if psbt_input.final_script_sig.is_some() || psbt_input.final_script_witness.is_some() {
                 continue;
             }
-            let confirmation_height = self
-                .indexed_graph
-                .graph()
-                .get_chain_position(&self.chain, chain_tip, input.previous_output.txid)
-                .map(|chain_position| {
-                    chain_position
-                        .confirmation_height_upper_bound()
-                        .unwrap_or(u32::MAX)
-                });
-            let current_height = sign_options
-                .assume_height
-                .unwrap_or_else(|| self.chain.tip().height());
 
             // - Try to derive the descriptor by looking at the txout. If it's in our database, we
             //   know exactly which `keychain` to use, and which derivation index it is
@@ -1878,14 +1871,7 @@ impl Wallet {
             match desc {
                 Some(desc) => {
                     let mut tmp_input = bitcoin::TxIn::default();
-                    match desc.satisfy(
-                        &mut tmp_input,
-                        (
-                            PsbtInputSatisfier::new(psbt, n),
-                            After::new(Some(current_height), false),
-                            Older::new(Some(current_height), confirmation_height, false),
-                        ),
-                    ) {
+                    match desc.satisfy(&mut tmp_input, PsbtInputSatisfier::new(psbt, n)) {
                         Ok(_) => {
                             // Set the UTXO fields, final script_sig and witness
                             // and clear everything else.
@@ -1962,26 +1948,53 @@ impl Wallet {
         descriptor.at_derivation_index(child).ok()
     }
 
-    fn get_available_utxos(&self) -> Vec<(LocalOutput, Weight)> {
-        self.list_unspent()
-            .map(|utxo| {
-                let keychain = utxo.keychain;
-                (utxo, {
-                    self.public_descriptor(keychain)
-                        .max_weight_to_satisfy()
-                        .unwrap()
-                })
-            })
-            .collect()
+    /// Try to create a [`Plan`] for the given `output`.
+    ///    
+    /// We want to afford the UTXO with as many assets as we can, so when looking for
+    /// absolute and relative timelocks if we can't get the value from the given
+    /// `spend_assets` we set it based on the current local height and the age of the
+    /// coin respectively.
+    fn try_plan(
+        &self,
+        output: LocalOutput,
+        spend_assets: &Assets,
+    ) -> Result<(Plan, Utxo), PlanError> {
+        let cur_height = self.latest_checkpoint().height();
+        let abs_locktime = spend_assets
+            .absolute_timelock
+            .unwrap_or(absolute::LockTime::from_consensus(cur_height));
+        let desc = self.public_descriptor(output.keychain);
+        let definite_desc = desc
+            .at_derivation_index(output.derivation_index)
+            .expect("valid derivation index");
+
+        let rel_locktime = spend_assets.relative_timelock.unwrap_or_else(|| {
+            let age = match output.chain_position {
+                ChainPosition::Confirmed { anchor, .. } => (cur_height - anchor.block_id.height)
+                    .try_into()
+                    .unwrap_or(u16::MAX),
+                ChainPosition::Unconfirmed { .. } => 0,
+            };
+            relative::LockTime::from_height(age)
+        });
+        let mut assets = Assets::new();
+        assets.extend(spend_assets)?;
+        assets = assets.after(abs_locktime);
+        assets = assets.older(rel_locktime);
+
+        let plan = definite_desc.plan(&assets).map_err(PlanError::Plan)?;
+
+        Ok((plan, Utxo::Local(output)))
     }
 
     /// Given the options returns the list of utxos that must be used to form the
     /// transaction and any further that may be used if needed.
     fn preselect_utxos(
         &self,
-        utxos: Vec<WeightedUtxo>,
+        mut must_spend: Vec<WeightedUtxo>,
+        mut may_spend: Vec<(LocalOutput, Weight)>,
         params: &TxParams,
-        current_height: Option<u32>,
+        current_height: u32,
     ) -> (Vec<WeightedUtxo>, Vec<WeightedUtxo>) {
         let TxParams {
             change_policy,
@@ -1992,22 +2005,9 @@ impl Wallet {
             ..
         } = params;
 
-        let manually_selected = utxos.clone();
         // we mandate confirmed transactions if we're bumping the fee
         let must_only_use_confirmed_tx = bumping_fee.is_some();
         let must_use_all_available = *drain_wallet;
-
-        let chain_tip = self.chain.tip().block_id();
-        //    must_spend <- manually selected utxos
-        //    may_spend  <- all other available utxos
-        let mut may_spend = self.get_available_utxos();
-
-        may_spend.retain(|may_spend| {
-            !manually_selected
-                .iter()
-                .any(|manually_selected| manually_selected.utxo.outpoint() == may_spend.0.outpoint)
-        });
-        let mut must_spend = manually_selected;
 
         // NOTE: we are intentionally ignoring `unspendable` here. i.e manual
         // selection overrides unspendable.
@@ -2017,20 +2017,13 @@ impl Wallet {
 
         let satisfies_confirmed = may_spend
             .iter()
-            .map(|u| -> bool {
-                let txid = u.0.outpoint.txid;
+            .map(|(utxo, _)| -> bool {
+                let txid = utxo.outpoint.txid;
                 let tx = match self.indexed_graph.graph().get_tx(txid) {
                     Some(tx) => tx,
                     None => return false,
                 };
-                let chain_position = match self.indexed_graph.graph().get_chain_position(
-                    &self.chain,
-                    chain_tip,
-                    txid,
-                ) {
-                    Some(chain_position) => chain_position.cloned(),
-                    None => return false,
-                };
+                let chain_position = utxo.chain_position;
 
                 // Whether the UTXO is mature and, if needed, confirmed
                 let mut spendable = true;
@@ -2042,26 +2035,26 @@ impl Wallet {
                         chain_position.is_confirmed(),
                         "coinbase must always be confirmed"
                     );
-                    if let Some(current_height) = current_height {
-                        match chain_position {
-                            ChainPosition::Confirmed { anchor, .. } => {
-                                // https://github.com/bitcoin/bitcoin/blob/c5e67be03bb06a5d7885c55db1f016fbf2333fe3/src/validation.cpp#L373-L375
-                                spendable &= (current_height
-                                    .saturating_sub(anchor.block_id.height))
-                                    >= COINBASE_MATURITY;
-                            }
-                            ChainPosition::Unconfirmed { .. } => spendable = false,
+                    match chain_position {
+                        ChainPosition::Confirmed { anchor, .. } => {
+                            // https://github.com/bitcoin/bitcoin/blob/c5e67be03bb06a5d7885c55db1f016fbf2333fe3/src/validation.cpp#L373-L375
+                            spendable &= (current_height.saturating_sub(anchor.block_id.height))
+                                >= COINBASE_MATURITY;
                         }
+                        ChainPosition::Unconfirmed { .. } => spendable = false,
                     }
                 }
                 spendable
             })
             .collect::<Vec<_>>();
 
+        // keep available coins that meet the change policy (not relevant in case of
+        // single keychain), were not specifically marked unspendable, and for which
+        // `satisfies_confirmed` is true.
         let mut i = 0;
-        may_spend.retain(|u| {
-            let retain = (self.keychains().count() == 1 || change_policy.is_satisfied_by(&u.0))
-                && !unspendable.contains(&u.0.outpoint)
+        may_spend.retain(|(utxo, _)| {
+            let retain = (self.keychains().count() == 1 || change_policy.is_satisfied_by(utxo))
+                && !unspendable.contains(&utxo.outpoint)
                 && satisfies_confirmed[i];
             i += 1;
             retain
@@ -2432,6 +2425,22 @@ impl Wallet {
             keychain
         }
     }
+
+    /// Returns the key [`Assets`] by collecting as many pubkeys as appear in the wallet's
+    /// descriptors.
+    ///
+    /// This is useful in cases where we have an unambiguous spending path (e.g. single-sig)
+    /// and therefore don't require the user to provide it.
+    fn assets(&self) -> Assets {
+        let mut pks = vec![];
+        for (_, desc) in self.keychains() {
+            desc.for_each_key(|k| {
+                pks.push(k.clone());
+                true
+            });
+        }
+        Assets::new().add(pks)
+    }
 }
 
 /// Methods to construct sync/full-scan requests for spk-based chain sources.
@@ -2564,7 +2573,7 @@ macro_rules! floating_rate {
 /// Macro for getting a wallet for use in a doctest
 macro_rules! doctest_wallet {
     () => {{
-        use $crate::bitcoin::{BlockHash, Transaction, absolute, TxOut, Network, hashes::Hash};
+        use $crate::bitcoin::{transaction, Amount, BlockHash, Transaction, absolute, TxOut, Network, hashes::Hash};
         use $crate::chain::{ConfirmationBlockTime, BlockId, TxGraph, tx_graph};
         use $crate::{Update, KeychainKind, Wallet};
         use $crate::test_utils::*;
