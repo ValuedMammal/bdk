@@ -16,6 +16,7 @@ use miniscript::{MiniscriptKey, Satisfier, ToPublicKey};
 use rand_core::RngCore;
 
 use crate::error::PlanError;
+use crate::Condition;
 
 /// `Secp256k1` context with `All` capabilities
 pub(crate) type SecpCtx = Secp256k1<All>;
@@ -76,6 +77,14 @@ pub(crate) fn check_nsequence_rbf(sequence: Sequence, csv: Sequence) -> bool {
     true
 }
 
+pub fn merge_nsequence(a: Sequence, b: Sequence) -> Result<Sequence, PlanError> {
+    if a.is_time_locked() != b.is_time_locked() {
+        Err(PlanError::MixedTimelockUnits)
+    } else {
+        Ok(a.max(b))
+    }
+}
+
 impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for After {
     fn check_after(&self, n: absolute::LockTime) -> bool {
         if let Some(current_height) = self.current_height {
@@ -119,77 +128,6 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for Older {
         } else {
             self.assume_height_reached
         }
-    }
-}
-
-/// Represents a condition that must be satisfied
-#[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Default, serde::Serialize)]
-pub struct Condition {
-    /// sequence value used as the argument to `OP_CHECKSEQUENCEVERIFY`
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub csv: Option<Sequence>,
-    /// absolute timelock value used as the argument to `OP_CHECKLOCKTIMEVERIFY`
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timelock: Option<absolute::LockTime>,
-}
-
-impl Condition {
-    /// Merges two absolute locktimes. Errors if `a` and `b` do not have the same unit.
-    pub(crate) fn merge_abs_locktime(
-        a: Option<absolute::LockTime>,
-        b: Option<absolute::LockTime>,
-    ) -> Result<Option<absolute::LockTime>, PlanError> {
-        match (a, b) {
-            (None, b) => Ok(b),
-            (a, None) => Ok(a),
-            (Some(a), Some(b)) => {
-                if a.is_block_height() != b.is_block_height() {
-                    Err(PlanError::MixedTimelockUnits)
-                } else if b > a {
-                    Ok(Some(b))
-                } else {
-                    Ok(Some(a))
-                }
-            }
-        }
-    }
-
-    /// Merges two relative locktimes. Errors if `a` and `b` do not have the same unit.
-    pub(crate) fn merge_rel_locktime(
-        a: Option<relative::LockTime>,
-        b: Option<relative::LockTime>,
-    ) -> Result<Option<relative::LockTime>, PlanError> {
-        match (a, b) {
-            (a, None) => Ok(a),
-            (None, b) => Ok(b),
-            (Some(a), Some(b)) => {
-                let seq = merge_nsequence(a.to_sequence(), b.to_sequence())?;
-                Ok(seq.to_relative_lock_time())
-            }
-        }
-    }
-
-    /// Merges the conditions of `other` with `self` keeping the greater of the two
-    /// for each individual condition. Locktime types must not be mixed or else a
-    /// [`PlanError`] is returned.
-    pub(crate) fn merge_condition(mut self, other: Condition) -> Result<Self, PlanError> {
-        self.timelock = Self::merge_abs_locktime(self.timelock, other.timelock)?;
-
-        match (self.csv, other.csv) {
-            (Some(a), Some(b)) => self.csv = Some(merge_nsequence(a, b)?),
-            (None, b) => self.csv = b,
-            _ => {}
-        }
-
-        Ok(self)
-    }
-}
-
-fn merge_nsequence(a: Sequence, b: Sequence) -> Result<Sequence, PlanError> {
-    if a.is_time_locked() != b.is_time_locked() {
-        Err(PlanError::MixedTimelockUnits)
-    } else {
-        Ok(a.max(b))
     }
 }
 

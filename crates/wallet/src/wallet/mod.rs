@@ -73,7 +73,7 @@ use crate::wallet::{
     error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError, PlanError},
     signer::{SignOptions, SignerError, SignerOrdering, SignersContainer, TransactionSigner},
     tx_builder::{FeePolicy, TxBuilder, TxParams},
-    utils::{check_nsequence_rbf, AssetsExt, Condition, SecpCtx},
+    utils::{check_nsequence_rbf, AssetsExt, SecpCtx},
 };
 
 // re-exports

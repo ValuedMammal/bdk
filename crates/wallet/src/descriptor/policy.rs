@@ -63,6 +63,7 @@ use crate::descriptor::ExtractPolicy;
 use crate::keys::ExtScriptContext;
 use crate::wallet::signer::{SignerId, SignersContainer};
 use crate::wallet::utils::{After, Older, SecpCtx};
+use crate::Condition;
 
 use super::checksum::calc_checksum;
 use super::error::Error;
@@ -443,8 +444,6 @@ pub struct Policy {
     /// How the wallet's descriptor can satisfy this policy node
     pub contribution: Satisfaction,
 }
-
-use crate::utils::Condition;
 
 impl Condition {
     fn merge_nlocktime(
