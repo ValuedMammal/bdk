@@ -1987,13 +1987,14 @@ impl Wallet {
             utxos,
             drain_wallet,
             manually_selected_only,
+            confirmed_only,
             bumping_fee,
             ..
         } = params;
 
         let manually_selected = utxos.clone();
         // we mandate confirmed transactions if we're bumping the fee
-        let must_only_use_confirmed_tx = bumping_fee.is_some();
+        let must_only_use_confirmed_tx = *confirmed_only || bumping_fee.is_some();
         let must_use_all_available = *drain_wallet;
 
         let chain_tip = self.chain.tip().block_id();

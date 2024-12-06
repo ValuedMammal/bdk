@@ -128,6 +128,7 @@ pub(crate) struct TxParams {
     pub(crate) utxos: Vec<WeightedUtxo>,
     pub(crate) unspendable: HashSet<OutPoint>,
     pub(crate) manually_selected_only: bool,
+    pub(crate) confirmed_only: bool,
     pub(crate) sighash: Option<psbt::PsbtSighashType>,
     pub(crate) ordering: TxOrdering,
     pub(crate) locktime: Option<absolute::LockTime>,
@@ -413,6 +414,12 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// [`add_utxo`]: Self::add_utxo
     pub fn manually_selected_only(&mut self) -> &mut Self {
         self.params.manually_selected_only = true;
+        self
+    }
+
+    /// The inputs to the transaction must be confirmed.
+    pub fn must_use_confirmed(&mut self) -> &mut Self {
+        self.params.confirmed_only = true;
         self
     }
 
