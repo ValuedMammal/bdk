@@ -250,6 +250,11 @@ where
             indexer,
         }
     }
+
+    /// Abandon tx
+    pub fn abandon_tx(&mut self, txid: Txid) {
+        self.graph.abandon_tx(txid);
+    }
 }
 
 /// Methods are available if the anchor (`A`) can be created from [`TxPosInBlock`].

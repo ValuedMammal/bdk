@@ -140,6 +140,7 @@ pub struct TxGraph<A = ()> {
     spends: BTreeMap<OutPoint, HashSet<Txid>>,
     anchors: BTreeSet<(A, Txid)>,
     last_seen: HashMap<Txid, u64>,
+    null_txs: HashSet<Txid>,
 
     // This atrocity exists so that `TxGraph::outspends()` can return a reference.
     // FIXME: This can be removed once `HashSet::new` is a const fn.
@@ -153,6 +154,7 @@ impl<A> Default for TxGraph<A> {
             spends: Default::default(),
             anchors: Default::default(),
             last_seen: Default::default(),
+            null_txs: Default::default(),
             empty_outspends: Default::default(),
         }
     }
@@ -415,6 +417,28 @@ impl<A> TxGraph<A> {
         self.spends
             .range(start..=end)
             .map(|(outpoint, spends)| (outpoint.vout, spends))
+    }
+
+    /// Abandon tx
+    ///
+    /// This informs the graph not to consider spends by an abandoned tx and to ignore
+    /// its outputs. Caveat that abandoning a tx does not prevent it from becoming
+    /// canonical as determined by a `ChainOracle`.
+    ///
+    /// The semantics are as follows:
+    ///
+    /// 1) In `filter_chain_txouts` txouts of an abandoned tx are not returned,
+    ///     provided that the abandoned tx is not confirmed.
+    ///
+    /// 2) In `filter_chain_unspents` unspents are kept if spent by an abandoned tx,
+    ///     provided that the abandoned tx is not confirmed.
+    pub fn abandon_tx(&mut self, txid: Txid) {
+        self.null_txs.insert(txid);
+    }
+
+    /// Whether `txid` is part of the null set
+    fn is_null_tx(&self, txid: &Txid) -> bool {
+        self.null_txs.contains(txid)
     }
 }
 
@@ -1041,6 +1065,10 @@ impl<A: Anchor> TxGraph<A> {
                             None => return Ok(None),
                         };
 
+                    if !chain_position.is_confirmed() && self.is_null_tx(&op.txid) {
+                        return Ok(None);
+                    }
+
                     let spent_by = self
                         .try_get_chain_spend(chain, chain_tip, op)?
                         .map(|(a, txid)| (a.cloned(), txid));
@@ -1102,8 +1130,16 @@ impl<A: Anchor> TxGraph<A> {
     ) -> impl Iterator<Item = Result<(OI, FullTxOut<A>), C::Error>> + 'a {
         self.try_filter_chain_txouts(chain, chain_tip, outpoints)
             .filter(|r| match r {
-                // keep unspents, drop spents
-                Ok((_, full_txo)) => full_txo.spent_by.is_none(),
+                Ok((_, full_txo)) => {
+                    match full_txo.spent_by.as_ref() {
+                        // keep unspents
+                        None => true,
+                        // keep if spent by an abandoned tx
+                        Some((pos, spend_txid)) => {
+                            !pos.is_confirmed() && self.is_null_tx(spend_txid)
+                        }
+                    }
+                }
                 // keep errors
                 Err(_) => true,
             })

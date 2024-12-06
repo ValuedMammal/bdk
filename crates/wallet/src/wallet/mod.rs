@@ -1940,7 +1940,6 @@ impl Wallet {
     /// Informs the wallet that you no longer intend to broadcast a tx that was built from it.
     ///
     /// This frees up the change address used when creating the tx for use in future transactions.
-    // TODO: Make this free up reserved utxos when that's implemented
     pub fn cancel_tx(&mut self, tx: &Transaction) {
         let txout_index = &mut self.indexed_graph.index;
         for txout in &tx.output {
@@ -1950,6 +1949,7 @@ impl Wallet {
                 txout_index.unmark_used(*keychain, *index);
             }
         }
+        self.indexed_graph.abandon_tx(tx.compute_txid());
     }
 
     fn get_descriptor_for_txout(&self, txout: &TxOut) -> Option<DerivedDescriptor> {
