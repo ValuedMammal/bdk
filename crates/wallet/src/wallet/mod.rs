@@ -1949,7 +1949,8 @@ impl Wallet {
                 txout_index.unmark_used(*keychain, *index);
             }
         }
-        self.indexed_graph.abandon_tx(tx.compute_txid());
+        let graph_change = self.indexed_graph.abandon_tx(tx.compute_txid());
+        self.stage.merge(graph_change.into());
     }
 
     fn get_descriptor_for_txout(&self, txout: &TxOut) -> Option<DerivedDescriptor> {

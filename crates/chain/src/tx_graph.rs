@@ -419,7 +419,7 @@ impl<A> TxGraph<A> {
             .map(|(outpoint, spends)| (outpoint.vout, spends))
     }
 
-    /// Abandon tx
+    /// Abandon a transaction
     ///
     /// This informs the graph not to consider spends by an abandoned tx and to ignore
     /// its outputs. Caveat that abandoning a tx does not prevent it from becoming
@@ -432,8 +432,12 @@ impl<A> TxGraph<A> {
     ///
     /// 2) In `filter_chain_unspents` unspents are kept if spent by an abandoned tx,
     ///     provided that the abandoned tx is not confirmed.
-    pub fn abandon_tx(&mut self, txid: Txid) {
-        self.null_txs.insert(txid);
+    pub fn abandon_tx(&mut self, txid: Txid) -> ChangeSet<A> {
+        let mut change = ChangeSet::default();
+        if self.null_txs.insert(txid) {
+            change.null_txs.push(txid);
+        }
+        change
     }
 
     /// Whether `txid` is part of the null set
@@ -737,6 +741,7 @@ impl<A: Clone + Ord> TxGraph<A> {
                 .collect(),
             anchors: self.anchors.clone(),
             last_seen: self.last_seen.iter().map(|(&k, &v)| (k, v)).collect(),
+            null_txs: self.null_txs.iter().copied().collect(),
         }
     }
 
@@ -753,6 +758,9 @@ impl<A: Clone + Ord> TxGraph<A> {
         }
         for (txid, seen_at) in changeset.last_seen {
             let _ = self.insert_seen_at(txid, seen_at);
+        }
+        for txid in changeset.null_txs {
+            let _ = self.abandon_tx(txid);
         }
     }
 }
@@ -1258,6 +1266,8 @@ pub struct ChangeSet<A = ()> {
     pub anchors: BTreeSet<(A, Txid)>,
     /// Added last-seen unix timestamps of transactions.
     pub last_seen: BTreeMap<Txid, u64>,
+    /// null txs
+    pub null_txs: Vec<Txid>,
 }
 
 impl<A> Default for ChangeSet<A> {
@@ -1267,6 +1277,7 @@ impl<A> Default for ChangeSet<A> {
             txouts: Default::default(),
             anchors: Default::default(),
             last_seen: Default::default(),
+            null_txs: Default::default(),
         }
     }
 }
@@ -1312,6 +1323,7 @@ impl<A: Ord> Merge for ChangeSet<A> {
         self.txs.extend(other.txs);
         self.txouts.extend(other.txouts);
         self.anchors.extend(other.anchors);
+        self.null_txs.extend(other.null_txs);
 
         // last_seen timestamps should only increase
         self.last_seen.extend(
@@ -1328,6 +1340,7 @@ impl<A: Ord> Merge for ChangeSet<A> {
             && self.txouts.is_empty()
             && self.anchors.is_empty()
             && self.last_seen.is_empty()
+            && self.null_txs.is_empty()
     }
 }
 
@@ -1347,6 +1360,7 @@ impl<A: Ord> ChangeSet<A> {
                 self.anchors.into_iter().map(|(a, txid)| (f(a), txid)),
             ),
             last_seen: self.last_seen,
+            null_txs: self.null_txs,
         }
     }
 }

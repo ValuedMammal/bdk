@@ -232,7 +232,8 @@ where
                 "CREATE TABLE {} ( \
                 txid TEXT PRIMARY KEY NOT NULL, \
                 raw_tx BLOB, \
-                last_seen INTEGER \
+                last_seen INTEGER, \
+                is_null INTEGER DEFAULT 0 \
                 ) STRICT",
                 Self::TXS_TABLE_NAME,
             ),
@@ -270,7 +271,7 @@ where
         let mut changeset = Self::default();
 
         let mut statement = db_tx.prepare(&format!(
-            "SELECT txid, raw_tx, last_seen FROM {}",
+            "SELECT txid, raw_tx, last_seen, is_null FROM {}",
             Self::TXS_TABLE_NAME,
         ))?;
         let row_iter = statement.query_map([], |row| {
@@ -278,15 +279,19 @@ where
                 row.get::<_, Impl<bitcoin::Txid>>("txid")?,
                 row.get::<_, Option<Impl<bitcoin::Transaction>>>("raw_tx")?,
                 row.get::<_, Option<u64>>("last_seen")?,
+                row.get::<_, bool>("is_null")?,
             ))
         })?;
         for row in row_iter {
-            let (Impl(txid), tx, last_seen) = row?;
+            let (Impl(txid), tx, last_seen, is_null) = row?;
             if let Some(Impl(tx)) = tx {
                 changeset.txs.insert(Arc::new(tx));
             }
             if let Some(last_seen) = last_seen {
                 changeset.last_seen.insert(txid, last_seen);
+            }
+            if is_null {
+                changeset.null_txs.push(txid);
             }
         }
 
@@ -356,6 +361,16 @@ where
             statement.execute(named_params! {
                 ":txid": Impl(txid),
                 ":last_seen": Some(checked_time),
+            })?;
+        }
+
+        let mut statement = db_tx.prepare_cached(&format!(
+            "INSERT INTO {}(txid, is_null) VALUES(:txid, 1) ON CONFLICT DO UPDATE SET is_null=1",
+            Self::TXS_TABLE_NAME,
+        ))?;
+        for txid in &self.null_txs {
+            statement.execute(named_params! {
+                ":txid": Impl(*txid),
             })?;
         }
 

@@ -251,9 +251,13 @@ where
         }
     }
 
-    /// Abandon tx
-    pub fn abandon_tx(&mut self, txid: Txid) {
-        self.graph.abandon_tx(txid);
+    /// Abandon tx, see [`abandon_tx`](crate::tx_graph::TxGraph::abandon_tx)
+    pub fn abandon_tx(&mut self, txid: Txid) -> ChangeSet<A, I::ChangeSet> {
+        let tx_graph = self.graph.abandon_tx(txid);
+        ChangeSet {
+            tx_graph,
+            indexer: I::ChangeSet::default(),
+        }
     }
 }
 
