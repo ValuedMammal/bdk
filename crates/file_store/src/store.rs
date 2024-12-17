@@ -14,10 +14,7 @@ use std::{
 /// > ⚠ This is a development/testing database. It does not natively support backwards compatible
 /// > BDK version upgrades so should not be used in production.
 #[derive(Debug)]
-pub struct Store<C>
-where
-    C: Sync + Send,
-{
+pub struct Store<C> {
     magic_len: usize,
     db_file: File,
     marker: PhantomData<C>,
@@ -25,11 +22,7 @@ where
 
 impl<C> Store<C>
 where
-    C: Merge
-        + serde::Serialize
-        + serde::de::DeserializeOwned
-        + core::marker::Send
-        + core::marker::Sync,
+    C: Merge + serde::Serialize + serde::de::DeserializeOwned,
 {
     /// Create a new [`Store`] file in write-only mode; error if the file exists.
     ///
@@ -97,7 +90,13 @@ where
         };
 
         // Get aggregated changeset
-        let aggregated_changeset = store.dump()?;
+        // Why not just return the partially agg'd changeset if possible
+        // along with a Store object. This way we can more easily recover
+        // from a corrupt file
+        let aggregated_changeset = match store.dump() {
+            Ok(c) => c,
+            Err(e) => e.changeset,
+        };
 
         Ok((aggregated_changeset, store))
     }
@@ -164,8 +163,8 @@ where
     /// first chunk of valid changesets.
     ///
     /// If garbage data is written and then valid changesets, the next load will still only
-    /// retrieve the first chunk of valid changesets. The recovery of those valied changesets after
-    /// the garbage data is responsability of the user
+    /// retrieve the first chunk of valid changesets. The recovery of those valid changesets after
+    /// the garbage data is responsibility of the user.
     pub fn append(&mut self, changeset: &C) -> Result<(), io::Error> {
         // no need to write anything if changeset is empty
         if changeset.is_empty() {
@@ -219,7 +218,6 @@ mod test {
         fs,
         io::{Seek, Write},
     };
-    use tempfile::NamedTempFile;
 
     const TEST_MAGIC_BYTES_LEN: usize = 12;
     const TEST_MAGIC_BYTES: [u8; TEST_MAGIC_BYTES_LEN] =
@@ -245,11 +243,11 @@ mod test {
 
     #[test]
     fn load_fails_if_file_is_too_short() {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(&TEST_MAGIC_BYTES[..TEST_MAGIC_BYTES_LEN - 1])
-            .expect("should write");
+        let tempdir = tempfile::tempdir().unwrap();
+        let file_path = tempdir.path().join("db_file");
+        fs::write(&file_path, &TEST_MAGIC_BYTES[..TEST_MAGIC_BYTES_LEN - 1]).expect("should write");
 
-        match Store::<TestChangeSet>::load(&TEST_MAGIC_BYTES, file.path()) {
+        match Store::<TestChangeSet>::load(&TEST_MAGIC_BYTES, &file_path) {
             Err(StoreErrorWithDump {
                 error: StoreError::Io(e),
                 ..
@@ -262,11 +260,11 @@ mod test {
     fn load_fails_if_magic_bytes_are_invalid() {
         let invalid_magic_bytes = "ldkfs0000000";
 
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(invalid_magic_bytes.as_bytes())
-            .expect("should write");
+        let tempdir = tempfile::tempdir().unwrap();
+        let file_path = tempdir.path().join("db_file");
+        fs::write(&file_path, invalid_magic_bytes.as_bytes()).expect("should write");
 
-        match Store::<TestChangeSet>::load(&TEST_MAGIC_BYTES, file.path()) {
+        match Store::<TestChangeSet>::load(&TEST_MAGIC_BYTES, &file_path) {
             Err(StoreErrorWithDump {
                 error: StoreError::InvalidMagicBytes { got, .. },
                 ..
@@ -278,7 +276,7 @@ mod test {
     }
 
     #[test]
-    fn load_fails_if_undecodable_bytes() {
+    fn load_ok_if_undecodable_bytes() {
         // initial data to write to file (magic bytes + invalid data)
         let mut data = [255_u8; 2000];
         data[..TEST_MAGIC_BYTES_LEN].copy_from_slice(&TEST_MAGIC_BYTES);
@@ -289,22 +287,20 @@ mod test {
         let file_path = temp_dir.path().join("db_file");
         let mut store =
             Store::<TestChangeSet>::create(&TEST_MAGIC_BYTES, &file_path).expect("should create");
-        store.append(&test_changesets).expect("should append");
 
         // Write garbage to file
         store.db_file.write_all(&data).expect("should write");
 
         drop(store);
 
-        match Store::<TestChangeSet>::load(&TEST_MAGIC_BYTES, file_path) {
-            Err(StoreErrorWithDump {
-                changeset,
-                error: StoreError::Bincode(_),
-            }) => {
-                assert_eq!(changeset, Some(test_changesets))
-            }
-            unexpected_res => panic!("unexpected result: {:?}", unexpected_res),
-        }
+        // load should return the partially aggregated changeset
+        let (agg_cs, mut store) = Store::load(&TEST_MAGIC_BYTES, &file_path).unwrap();
+        assert!(agg_cs.is_none());
+
+        // load again after writing a valid changeset
+        store.append(&test_changesets).expect("should append");
+        let (agg_cs, _) = Store::<TestChangeSet>::load(&TEST_MAGIC_BYTES, &file_path).unwrap();
+        assert_eq!(agg_cs, Some(test_changesets));
     }
 
     #[test]
@@ -426,28 +422,17 @@ mod test {
             // load file again and aggregate changesets
             // write the last changeset again (this time it succeeds)
             {
-                let err = Store::<TestChangeSet>::load(&TEST_MAGIC_BYTES, &file_path)
-                    .expect_err("should fail to aggregate");
+                let (agg_changeset, mut store) =
+                    Store::<TestChangeSet>::load(&TEST_MAGIC_BYTES, &file_path).expect("must");
                 assert_eq!(
-                    err.changeset,
-                    changesets.iter().cloned().reduce(|mut acc, cs| {
+                    &agg_changeset,
+                    &changesets.iter().cloned().reduce(|mut acc, cs| {
                         Merge::merge(&mut acc, cs);
                         acc
                     }),
                     "should recover all changesets that are written in full",
                 );
-                // Remove file and start again
-                fs::remove_file(&file_path).expect("should remove file");
-                let mut store =
-                    Store::<TestChangeSet>::create(&TEST_MAGIC_BYTES, &file_path).unwrap();
-                for changeset in &changesets {
-                    store.append(changeset).unwrap();
-                }
-                // this is the incomplete write
-                store
-                    .db_file
-                    .write_all(&last_changeset_bytes)
-                    .expect("should write last changeset in full");
+                store.append(&last_changeset).unwrap();
             }
 
             // load file again - this time we should successfully aggregate all changesets
