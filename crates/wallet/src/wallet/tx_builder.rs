@@ -274,25 +274,29 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// These have priority over the "unspendable" utxos, meaning that if a utxo is present both in
     /// the "utxos" and the "unspendable" list, it will be spent.
     pub fn add_utxos(&mut self, outpoints: &[OutPoint]) -> Result<&mut Self, AddUtxoError> {
-        {
-            let wallet = &mut self.wallet;
-            let utxos = outpoints
-                .iter()
-                .map(|outpoint| {
-                    wallet
-                        .get_utxo(*outpoint)
-                        .ok_or(AddUtxoError::UnknownUtxo(*outpoint))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+        let wallet = &mut self.wallet;
+        let utxos = outpoints
+            .iter()
+            .map(|outpoint| {
+                wallet
+                    .get_utxo(*outpoint)
+                    .or_else(|| {
+                        // allow selecting a spent output if we're bumping fee
+                        self.params
+                            .bumping_fee
+                            .and_then(|_| wallet.get_output(*outpoint))
+                    })
+                    .ok_or(AddUtxoError::UnknownUtxo(*outpoint))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-            for utxo in utxos {
-                let descriptor = wallet.public_descriptor(utxo.keychain);
-                let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
-                self.params.utxos.push(WeightedUtxo {
-                    satisfaction_weight,
-                    utxo: Utxo::Local(utxo),
-                });
-            }
+        for utxo in utxos {
+            let descriptor = wallet.public_descriptor(utxo.keychain);
+            let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
+            self.params.utxos.push(WeightedUtxo {
+                satisfaction_weight,
+                utxo: Utxo::Local(utxo),
+            });
         }
 
         Ok(self)
@@ -304,6 +308,106 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// the "utxos" and the "unspendable" list, it will be spent.
     pub fn add_utxo(&mut self, outpoint: OutPoint) -> Result<&mut Self, AddUtxoError> {
         self.add_utxos(&[outpoint])
+    }
+
+    /// Replace an unconfirmed transaction.
+    ///
+    /// This method attempts to create a replacement for the transaction with `txid` by
+    /// looking for the largest input that is owned by this wallet and adding it to the
+    /// list of UTXOs to spend.
+    ///
+    /// # Note
+    ///
+    /// Aside from reusing one of the inputs, the method makes no assumptions about the
+    /// structure of the replacement, so if you need to reuse the original recipient(s)
+    /// and/or change address, you should add them manually before [`finish`] is called.
+    ///
+    /// # Example
+    ///
+    /// Create a replacement for an unconfirmed wallet transaction
+    ///
+    /// ```rust,no_run
+    /// # let mut wallet = bdk_wallet::doctest_wallet!();
+    /// let wallet_txs = wallet.transactions().collect::<Vec<_>>();
+    /// let tx = wallet_txs.first().expect("must have wallet tx");
+    ///
+    /// if !tx.chain_position.is_confirmed() {
+    ///     let txid = tx.tx_node.txid;
+    ///     let mut builder = wallet.build_tx();
+    ///     builder.replace_tx(txid).expect("should replace");
+    ///
+    ///     // Continue building tx...
+    ///
+    ///     let psbt = builder.finish()?;
+    /// }
+    /// # Ok::<_, anyhow::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - If the original transaction is not found in the tx graph
+    /// - If the orginal transaction is confirmed
+    /// - If none of the inputs are owned by this wallet
+    ///
+    /// [`finish`]: TxBuilder::finish
+    pub fn replace_tx(&mut self, txid: Txid) -> Result<&mut Self, ReplaceTxError> {
+        let tx = self
+            .wallet
+            .indexed_graph
+            .graph()
+            .get_tx(txid)
+            .ok_or(ReplaceTxError::MissingTransaction)?;
+        if self
+            .wallet
+            .transactions()
+            .find(|c| c.tx_node.txid == txid)
+            .map(|c| c.chain_position.is_confirmed())
+            .unwrap_or(false)
+        {
+            return Err(ReplaceTxError::TransactionConfirmed);
+        }
+        let outpoint = tx
+            .input
+            .iter()
+            .filter_map(|txin| {
+                let prev_tx = self
+                    .wallet
+                    .indexed_graph
+                    .graph()
+                    .get_tx(txin.previous_output.txid)?;
+                let txout = &prev_tx.output[txin.previous_output.vout as usize];
+                if self.wallet.is_mine(txout.script_pubkey.clone()) {
+                    Some((txin.previous_output, txout.value))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(_, value)| *value)
+            .map(|(op, _)| op)
+            .ok_or(ReplaceTxError::NonReplaceable)?;
+
+        // add previous fee
+        if let Ok(absolute) = self.wallet.calculate_fee(&tx) {
+            let rate = absolute / tx.weight();
+            let previous_fee = PreviousFee { absolute, rate };
+            self.params.bumping_fee = Some(previous_fee);
+        }
+
+        self.add_utxo(outpoint).map_err(|e| match e {
+            AddUtxoError::UnknownUtxo(op) => ReplaceTxError::MissingOutput(op),
+        })?;
+
+        // do not try to spend the outputs of the tx being replaced
+        self.params
+            .unspendable
+            .extend((0..tx.output.len()).map(|vout| OutPoint::new(txid, vout as u32)));
+
+        Ok(self)
+    }
+
+    /// Get the previous feerate, i.e. the feerate of the tx being fee-bumped, if any.
+    pub fn previous_fee(&self) -> Option<FeeRate> {
+        self.params.bumping_fee.map(|p| p.rate)
     }
 
     /// Add a foreign UTXO i.e. a UTXO not owned by this wallet.
@@ -696,6 +800,35 @@ impl fmt::Display for AddUtxoError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for AddUtxoError {}
+
+/// Error returned by [`TxBuilder::replace_tx`].
+#[derive(Debug)]
+pub enum ReplaceTxError {
+    /// Unable to find a locally owned output
+    MissingOutput(OutPoint),
+    /// Transaction was not found in tx graph
+    MissingTransaction,
+    /// Transaction can't be replaced by this wallet
+    NonReplaceable,
+    /// Transaction is already confirmed
+    TransactionConfirmed,
+}
+
+impl fmt::Display for ReplaceTxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOutput(op) => {
+                write!(f, "could not find wallet output for outpoint {}", op)
+            }
+            Self::MissingTransaction => write!(f, "transaction not found in tx graph"),
+            Self::NonReplaceable => write!(f, "no replaceable input found"),
+            Self::TransactionConfirmed => write!(f, "cannot replace a confirmed tx"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ReplaceTxError {}
 
 #[derive(Debug)]
 /// Error returned from [`TxBuilder::add_foreign_utxo`].

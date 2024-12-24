@@ -4280,3 +4280,49 @@ fn test_wallet_transactions_relevant() {
     assert!(full_tx_count_before < full_tx_count_after);
     assert!(canonical_tx_count_before < canonical_tx_count_after);
 }
+
+#[test]
+fn replace_tx_allows_selecting_spent_inputs() {
+    let (mut wallet, txid_0) = get_funded_wallet_wpkh();
+    let outpoint_1 = OutPoint::new(txid_0, 0);
+
+    // receive output 2
+    let outpoint_2 = receive_output_in_latest_block(&mut wallet, 49_000);
+    assert_eq!(wallet.list_unspent().count(), 2);
+    assert_eq!(wallet.balance().total().to_sat(), 99_000);
+
+    // create tx1: 2-in/1-out sending all to `recip`
+    let recip = ScriptBuf::from_hex("0014446906a6560d8ad760db3156706e72e171f3a2aa").unwrap();
+    let mut builder = wallet.build_tx();
+    builder.add_recipient(recip.clone(), Amount::from_sat(98_800));
+    let psbt = builder.finish().unwrap();
+    let tx1 = psbt.unsigned_tx;
+    let txid1 = tx1.compute_txid();
+    insert_tx(&mut wallet, tx1);
+    assert!(wallet.list_unspent().next().is_none());
+
+    // now replace tx1 with a new transaction
+    let mut builder = wallet.build_tx();
+    builder.replace_tx(txid1).expect("should replace input");
+    let prev_feerate = builder.previous_fee().unwrap();
+    builder.add_recipient(recip, Amount::from_sat(98_500));
+    builder.fee_rate(FeeRate::from_sat_per_kwu(
+        prev_feerate.to_sat_per_kwu() + 250,
+    ));
+
+    // Because outpoint 2 was spent in tx1, by default it won't be available for selection,
+    // but we can add it manually, with the caveat that the builder is in a bump-fee
+    // context.
+    builder.add_utxo(outpoint_2).expect("should add output");
+    let psbt = builder.finish().unwrap();
+
+    let tx2 = psbt.unsigned_tx;
+    assert!(tx2
+        .input
+        .iter()
+        .any(|txin| txin.previous_output == outpoint_1));
+    assert!(tx2
+        .input
+        .iter()
+        .any(|txin| txin.previous_output == outpoint_2));
+}
