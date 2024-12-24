@@ -889,6 +889,21 @@ impl Wallet {
             .next()
     }
 
+    /// Get a local output if the txout referenced by `outpoint` exists on chain and can
+    /// be found in the inner tx graph.
+    fn get_output(&self, outpoint: OutPoint) -> Option<LocalOutput> {
+        let ((keychain, index), _) = self.indexed_graph.index.txout(outpoint)?;
+        self.indexed_graph
+            .graph()
+            .filter_chain_txouts(
+                &self.chain,
+                self.chain.tip().block_id(),
+                core::iter::once(((), outpoint)),
+            )
+            .map(|(_, full_txo)| new_local_utxo(keychain, index, full_txo))
+            .next()
+    }
+
     /// Inserts a [`TxOut`] at [`OutPoint`] into the wallet's transaction graph.
     ///
     /// This is used for providing a previous output's value so that we can use [`calculate_fee`]

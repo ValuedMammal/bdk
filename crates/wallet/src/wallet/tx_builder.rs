@@ -274,25 +274,29 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// These have priority over the "unspendable" utxos, meaning that if a utxo is present both in
     /// the "utxos" and the "unspendable" list, it will be spent.
     pub fn add_utxos(&mut self, outpoints: &[OutPoint]) -> Result<&mut Self, AddUtxoError> {
-        {
-            let wallet = &mut self.wallet;
-            let utxos = outpoints
-                .iter()
-                .map(|outpoint| {
-                    wallet
-                        .get_utxo(*outpoint)
-                        .ok_or(AddUtxoError::UnknownUtxo(*outpoint))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+        let wallet = &mut self.wallet;
+        let utxos = outpoints
+            .iter()
+            .map(|outpoint| {
+                wallet
+                    .get_utxo(*outpoint)
+                    .or_else(|| {
+                        // allow selecting a spent output if we're bumping fee
+                        self.params
+                            .bumping_fee
+                            .and_then(|_| wallet.get_output(*outpoint))
+                    })
+                    .ok_or(AddUtxoError::UnknownUtxo(*outpoint))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-            for utxo in utxos {
-                let descriptor = wallet.public_descriptor(utxo.keychain);
-                let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
-                self.params.utxos.push(WeightedUtxo {
-                    satisfaction_weight,
-                    utxo: Utxo::Local(utxo),
-                });
-            }
+        for utxo in utxos {
+            let descriptor = wallet.public_descriptor(utxo.keychain);
+            let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
+            self.params.utxos.push(WeightedUtxo {
+                satisfaction_weight,
+                utxo: Utxo::Local(utxo),
+            });
         }
 
         Ok(self)
@@ -304,6 +308,77 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// the "utxos" and the "unspendable" list, it will be spent.
     pub fn add_utxo(&mut self, outpoint: OutPoint) -> Result<&mut Self, AddUtxoError> {
         self.add_utxos(&[outpoint])
+    }
+
+    /// Replace a transaction.
+    ///
+    /// This method will attempt to create a replacement for the transaction with `txid`
+    /// by looking for the largest input that belongs to the wallet and adding it to the
+    /// list of UTXOs to spend.
+    ///
+    /// # Errors
+    ///
+    /// - If the original tx isn't found in the transaction graph
+    /// - If the orginal tx is confirmed
+    /// - If no inputs are replaceable by this wallet
+    pub fn replace_tx(&mut self, txid: Txid) -> Result<&mut Self, ReplaceTxError> {
+        let tx = self
+            .wallet
+            .indexed_graph
+            .graph()
+            .get_tx(txid)
+            .ok_or(ReplaceTxError::MissingTransaction)?;
+        if self
+            .wallet
+            .transactions()
+            .find(|c| c.tx_node.txid == txid)
+            .map(|c| c.chain_position.is_confirmed())
+            .unwrap_or(false)
+        {
+            return Err(ReplaceTxError::TransactionConfirmed);
+        }
+        let outpoint = tx
+            .input
+            .iter()
+            .filter_map(|txin| {
+                let prev_tx = self
+                    .wallet
+                    .indexed_graph
+                    .graph()
+                    .get_tx(txin.previous_output.txid)?;
+                let txout = &prev_tx.output[txin.previous_output.vout as usize];
+                if self.wallet.is_mine(txout.script_pubkey.clone()) {
+                    Some((txin.previous_output, txout.value))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(_, value)| *value)
+            .map(|(op, _)| op)
+            .ok_or(ReplaceTxError::NonReplaceable)?;
+
+        // add previous fee
+        if let Ok(absolute) = self.wallet.calculate_fee(&tx) {
+            let rate = absolute / tx.weight();
+            let previous_fee = PreviousFee { absolute, rate };
+            self.params.bumping_fee = Some(previous_fee);
+        }
+
+        self.add_utxo(outpoint).map_err(|e| match e {
+            AddUtxoError::UnknownUtxo(op) => ReplaceTxError::MissingOutput(op),
+        })?;
+
+        // do not try to spend the outputs of the tx being replaced
+        self.params
+            .unspendable
+            .extend((0..tx.output.len()).map(|vout| OutPoint::new(txid, vout as u32)));
+
+        Ok(self)
+    }
+
+    /// Get the previous feerate, i.e. the feerate of the tx being fee-bumped, if any.
+    pub fn previous_fee(&self) -> Option<FeeRate> {
+        self.params.bumping_fee.map(|p| p.rate)
     }
 
     /// Add a foreign UTXO i.e. a UTXO not owned by this wallet.
@@ -697,6 +772,35 @@ impl fmt::Display for AddUtxoError {
 #[cfg(feature = "std")]
 impl std::error::Error for AddUtxoError {}
 
+/// Error returned by [`TxBuilder::replace_tx`].
+#[derive(Debug)]
+pub enum ReplaceTxError {
+    /// Unable to find a locally owned output
+    MissingOutput(OutPoint),
+    /// Transaction was not found in tx graph
+    MissingTransaction,
+    /// Transaction can't be replaced by this wallet
+    NonReplaceable,
+    /// Transaction is already confirmed
+    TransactionConfirmed,
+}
+
+impl fmt::Display for ReplaceTxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOutput(op) => {
+                write!(f, "could not find wallet output for outpoint {}", op)
+            }
+            Self::MissingTransaction => write!(f, "transaction not found in tx graph"),
+            Self::NonReplaceable => write!(f, "no replaceable input found"),
+            Self::TransactionConfirmed => write!(f, "cannot replace a confirmed tx"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ReplaceTxError {}
+
 #[derive(Debug)]
 /// Error returned from [`TxBuilder::add_foreign_utxo`].
 pub enum AddForeignUtxoError {
@@ -848,6 +952,9 @@ mod test {
     use bitcoin::consensus::deserialize;
     use bitcoin::hex::FromHex;
     use bitcoin::TxOut;
+
+    use crate::test_utils::*;
+    use crate::SignOptions;
 
     use super::*;
     #[test]
@@ -1069,5 +1176,58 @@ mod test {
     fn test_default_tx_version_1() {
         let version = Version::default();
         assert_eq!(version.0, 1);
+    }
+
+    #[test]
+    fn replace_tx_add_utxo() {
+        // `replace_tx` should allow re-selecting spent inputs
+
+        // problem: `replace_tx` will pick one input to replace, however we should be able to re-use any/all
+        // of the same inputs. e.g., say the wallet has two utxos and they're both used in tx1. `replace_tx`
+        // will add one of the inputs to tx2. In order for the second output to be avail for coin-selection,
+        // `add_utxo` needs to allow selecting already spent inputs - ideally only if we know that we're
+        // bumping fee
+
+        let (mut wallet, _txid0) = get_funded_wallet_wpkh();
+        let op1 = wallet.list_unspent().map(|u| u.outpoint).next().unwrap();
+
+        // receive output 2
+        let op2 = receive_output_in_latest_block(&mut wallet, 50_500);
+        assert_eq!(wallet.list_unspent().count(), 2);
+        assert_eq!(wallet.balance().total().to_sat(), 100_500);
+
+        // create tx1
+        let recip = ScriptBuf::from_hex("0014446906a6560d8ad760db3156706e72e171f3a2aa").unwrap();
+        let mut b = wallet.build_tx();
+        b.add_recipient(recip.clone(), Amount::from_sat(100_000));
+        let mut psbt = b.finish().unwrap();
+
+        assert!(wallet.sign(&mut psbt, SignOptions::default()).unwrap());
+        let tx1 = psbt.extract_tx().unwrap();
+        let txid1 = tx1.compute_txid();
+        insert_tx(&mut wallet, tx1);
+        assert_eq!(wallet.balance().total(), Amount::ZERO);
+
+        // create tx2 that replaces tx1
+        let mut b = wallet.build_tx();
+        b.replace_tx(txid1).expect("should replace input");
+        let prev_feerate = b.previous_fee().unwrap();
+        b.add_recipient(recip, Amount::from_sat(99_500));
+        b.fee_rate(FeeRate::from_sat_per_kwu(
+            prev_feerate.to_sat_per_kwu() + 250,
+        ));
+
+        // Because op1 is technically spent, by default it won't be available for selection,
+        // but we can add it manually, with the caveat that the builder is in a bump-fee
+        // context.
+        b.add_utxo(op1).expect("should add output");
+        let mut psbt = b.finish().unwrap();
+
+        assert!(wallet.sign(&mut psbt, SignOptions::default()).unwrap());
+        let tx2 = psbt.extract_tx().unwrap();
+        assert!(tx2.input.iter().any(|txin| txin.previous_output == op1));
+        assert!(tx2.input.iter().any(|txin| txin.previous_output == op2));
+        insert_tx(&mut wallet, tx2);
+        assert_eq!(wallet.balance().total(), Amount::ZERO);
     }
 }
