@@ -1419,7 +1419,7 @@ impl Wallet {
         fee_amount += fee_rate * tx.weight();
 
         let (required_utxos, optional_utxos) =
-            self.preselect_utxos(&params, Some(current_height.to_consensus_u32()));
+            self.preselect_utxos(&params, current_height.to_consensus_u32());
 
         // get drain script
         let mut drain_index = Option::<(KeychainKind, u32)>::None;
@@ -1992,7 +1992,7 @@ impl Wallet {
     fn preselect_utxos(
         &self,
         params: &TxParams,
-        current_height: Option<u32>,
+        current_height: u32,
     ) -> (Vec<WeightedUtxo>, Vec<WeightedUtxo>) {
         let TxParams {
             change_policy,
@@ -2046,16 +2046,13 @@ impl Wallet {
                         chain_position.is_confirmed(),
                         "coinbase must always be confirmed"
                     );
-                    if let Some(current_height) = current_height {
-                        match chain_position {
-                            ChainPosition::Confirmed { anchor, .. } => {
-                                // https://github.com/bitcoin/bitcoin/blob/c5e67be03bb06a5d7885c55db1f016fbf2333fe3/src/validation.cpp#L373-L375
-                                spendable &= (current_height
-                                    .saturating_sub(anchor.block_id.height))
-                                    >= COINBASE_MATURITY;
-                            }
-                            ChainPosition::Unconfirmed { .. } => spendable = false,
+                    match chain_position {
+                        ChainPosition::Confirmed { anchor, .. } => {
+                            // https://github.com/bitcoin/bitcoin/blob/c5e67be03bb06a5d7885c55db1f016fbf2333fe3/src/validation.cpp#L373-L375
+                            spendable &= (current_height.saturating_sub(anchor.block_id.height))
+                                >= COINBASE_MATURITY;
                         }
+                        ChainPosition::Unconfirmed { .. } => spendable = false,
                     }
                 }
                 spendable
