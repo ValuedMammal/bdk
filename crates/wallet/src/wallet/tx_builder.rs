@@ -134,6 +134,7 @@ pub(crate) struct TxParams {
     pub(crate) sequence: Option<Sequence>,
     pub(crate) version: Option<Version>,
     pub(crate) change_policy: ChangeSpendPolicy,
+    pub(crate) confirmation_policy: BTreeMap<KeychainKind, u32>,
     pub(crate) only_witness_utxo: bool,
     pub(crate) add_global_xpubs: bool,
     pub(crate) include_output_redeem_witness_script: bool,
@@ -413,6 +414,33 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// [`add_utxo`]: Self::add_utxo
     pub fn manually_selected_only(&mut self) -> &mut Self {
         self.params.manually_selected_only = true;
+        self
+    }
+
+    /// The inputs to the transaction must be confirmed.
+    ///
+    /// Note that this option can be overridden by manually adding inputs using a method
+    /// such as [`TxBuilder::add_utxo`].
+    pub fn must_use_confirmed(&mut self) -> &mut Self {
+        use crate::KeychainKind::*;
+        for keychain in [External, Internal] {
+            self.params
+                .confirmation_policy
+                .entry(keychain)
+                .and_modify(|n| {
+                    *n = (*n).max(1);
+                })
+                .or_insert(1);
+        }
+        self
+    }
+
+    /// Minimum number `n` of confirmations required to spend a UTXO of the given `keychain`.
+    ///
+    /// The default is 0 for all keychains, meaning the wallet may try to spend outputs of
+    /// unconfirmed transactions.
+    pub fn min_confs(&mut self, keychain: KeychainKind, n: u32) -> &mut Self {
+        self.params.confirmation_policy.insert(keychain, n);
         self
     }
 
@@ -845,11 +873,40 @@ mod test {
         };
     }
 
-    use bitcoin::consensus::deserialize;
-    use bitcoin::hex::FromHex;
-    use bitcoin::TxOut;
-
     use super::*;
+    use crate::test_utils::*;
+    use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::Hash;
+    use bitcoin::hex::FromHex;
+    use bitcoin::{BlockHash, TxOut};
+
+    /// Get a wallet with two unconfirmed outputs, one on each keychain.
+    fn wallet_with_unconfirmed_utxos() -> (Wallet, Vec<OutPoint>) {
+        use crate::SignOptions;
+        use KeychainKind::*;
+
+        let (mut wallet, _) = get_funded_wallet_wpkh();
+        assert_eq!(wallet.balance().total().to_sat(), 50_000);
+        let addr = wallet.reveal_next_address(External);
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), Amount::from_sat(25_000));
+        let mut psbt = builder.finish().unwrap();
+
+        assert!(wallet.sign(&mut psbt, SignOptions::default()).unwrap());
+        let tx = psbt.extract_tx().unwrap();
+        insert_tx(&mut wallet, tx);
+        let unspent = wallet.list_unspent().collect::<Vec<_>>();
+        assert_eq!(unspent.len(), 2);
+        assert!(unspent.iter().any(|u| u.keychain == External));
+        assert!(unspent.iter().any(|u| u.keychain == Internal));
+        assert!(!unspent.iter().any(|u| u.chain_position.is_confirmed()));
+
+        let outpoints = unspent.into_iter().map(|u| u.outpoint).collect();
+
+        (wallet, outpoints)
+    }
+
     #[test]
     fn test_output_ordering_untouched() {
         let original_tx = ordering_test_tx!();
@@ -1069,5 +1126,106 @@ mod test {
     fn test_default_tx_version_1() {
         let version = Version::default();
         assert_eq!(version.0, 1);
+    }
+
+    #[test]
+    fn test_must_use_confirmed() {
+        let (mut wallet, _) = wallet_with_unconfirmed_utxos();
+        let recip = wallet
+            .reveal_next_address(KeychainKind::External)
+            .script_pubkey();
+        let amount = wallet.balance().total() - Amount::from_sat(256);
+
+        // Builder should disallow spending unconfirmed utxos
+        let mut builder = wallet.build_tx();
+        builder.must_use_confirmed().add_recipient(recip, amount);
+
+        let _ = builder.finish().unwrap_err();
+    }
+    #[test]
+    fn manually_selected_overrides_conf_policy() {
+        let (mut wallet, outpoints) = wallet_with_unconfirmed_utxos();
+        let recip = wallet
+            .reveal_next_address(KeychainKind::External)
+            .script_pubkey();
+        let amount = wallet.balance().total() - Amount::from_sat(256);
+
+        let mut builder = wallet.build_tx();
+        builder
+            .must_use_confirmed()
+            .add_utxos(&outpoints)
+            .unwrap()
+            .add_recipient(recip, amount);
+
+        let _ = builder.finish().unwrap();
+    }
+
+    #[test]
+    fn allow_spending_unconfirmed_but_trusted() {
+        use KeychainKind::*;
+        let (mut wallet, _) = wallet_with_unconfirmed_utxos();
+        let recip = wallet.reveal_next_address(External).script_pubkey();
+        let amount = wallet.balance().total() - Amount::from_sat(256);
+
+        // Require 1 confirmation for utxos on external keychain,
+        // therefore attempting to send all should fail
+        let mut builder = wallet.build_tx();
+        builder
+            .min_confs(External, 1)
+            .add_recipient(recip.clone(), amount);
+
+        let _ = builder.finish().unwrap_err();
+
+        // Reduce the send amount to below that of the change output,
+        // now `finish` should succeed
+        let mut builder = wallet.build_tx();
+        builder
+            .min_confs(External, 1)
+            .add_recipient(recip, Amount::from_sat(24_000));
+
+        let _ = builder.finish().unwrap();
+    }
+
+    #[test]
+    fn minimum_confirmations_spend_policy() {
+        use bdk_chain::{BlockId, ConfirmationBlockTime};
+        use KeychainKind::*;
+        let (mut wallet, outpoints) = wallet_with_unconfirmed_utxos();
+        let recip = wallet
+            .reveal_next_address(KeychainKind::External)
+            .script_pubkey();
+        let amount = wallet.balance().total() - Amount::from_sat(256);
+
+        // Set min-confs to 3, `finish` should fail
+        let mut builder = wallet.build_tx();
+        builder
+            .min_confs(External, 3)
+            .min_confs(Internal, 3)
+            .add_recipient(recip.clone(), amount);
+
+        let _ = builder.finish().unwrap_err();
+
+        // Now add 3 confirmations, `finish` should succeed
+        let txid = outpoints.first().unwrap().txid;
+        let block_id = wallet.latest_checkpoint().block_id();
+        let anchor = ConfirmationBlockTime {
+            block_id,
+            confirmation_time: 200,
+        };
+        insert_anchor(&mut wallet, txid, anchor);
+
+        let block = BlockId {
+            height: block_id.height + 3,
+            hash: BlockHash::all_zeros(),
+        };
+        insert_checkpoint(&mut wallet, block);
+
+        let mut builder = wallet.build_tx();
+        builder
+            .min_confs(External, 3)
+            .min_confs(Internal, 3)
+            .add_recipient(recip.clone(), amount);
+
+        let _ = builder.finish().unwrap();
     }
 }

@@ -2000,13 +2000,12 @@ impl Wallet {
             utxos,
             drain_wallet,
             manually_selected_only,
+            confirmation_policy,
             bumping_fee,
             ..
         } = params;
 
         let manually_selected = utxos.clone();
-        // we mandate confirmed transactions if we're bumping the fee
-        let must_only_use_confirmed_tx = bumping_fee.is_some();
         let must_use_all_available = *drain_wallet;
 
         //    must_spend <- manually selected utxos
@@ -2035,25 +2034,36 @@ impl Wallet {
                     None => return false,
                 };
 
-                // Whether the UTXO is mature and, if needed, confirmed
+                // Whether the UTXO is mature and, if needed, confirmed to a certain depth
                 let mut spendable = true;
                 let chain_position = u.0.chain_position;
-                if must_only_use_confirmed_tx && !chain_position.is_confirmed() {
+
+                // we mandate confirmed transactions if we're bumping the fee
+                if bumping_fee.is_some() && !chain_position.is_confirmed() {
                     return false;
                 }
+
+                let n_confs = current_height.saturating_sub(
+                    chain_position
+                        .confirmation_height_upper_bound()
+                        .unwrap_or(current_height),
+                );
+                if n_confs
+                    < confirmation_policy
+                        .get(&u.0.keychain)
+                        .copied()
+                        .unwrap_or_default()
+                {
+                    return false;
+                }
+
                 if tx.is_coinbase() {
                     debug_assert!(
                         chain_position.is_confirmed(),
                         "coinbase must always be confirmed"
                     );
-                    match chain_position {
-                        ChainPosition::Confirmed { anchor, .. } => {
-                            // https://github.com/bitcoin/bitcoin/blob/c5e67be03bb06a5d7885c55db1f016fbf2333fe3/src/validation.cpp#L373-L375
-                            spendable &= (current_height.saturating_sub(anchor.block_id.height))
-                                >= COINBASE_MATURITY;
-                        }
-                        ChainPosition::Unconfirmed { .. } => spendable = false,
-                    }
+                    // https://github.com/bitcoin/bitcoin/blob/c5e67be03bb06a5d7885c55db1f016fbf2333fe3/src/validation.cpp#L373-L375
+                    spendable &= n_confs >= COINBASE_MATURITY;
                 }
                 spendable
             })
