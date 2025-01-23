@@ -13,12 +13,12 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
-bdk_core = { path = "../core", version = "0.4.1" }
+bdk_core = { version = "0.4.1" }
 electrum-client = { version = "0.22", features = [ "proxy" ], default-features = false }
 
 [dev-dependencies]
 bdk_testenv = { path = "../testenv" }
-bdk_chain = { path = "../chain" }
+bdk_chain = { version = "0.21.1" }
 
 [features]
 default = ["use-rustls"]

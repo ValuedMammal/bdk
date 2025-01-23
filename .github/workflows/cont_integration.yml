@@ -179,7 +179,8 @@ jobs:
           override: true
           profile: minimal
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2.7.5
+        uses: Swatinem/rust-cache@v2.2.1
+      # TODO: should lint each example crate
       - name: Build
         working-directory: example-crates/${{ matrix.example-dir }}
         run: cargo build
