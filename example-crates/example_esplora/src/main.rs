@@ -13,6 +13,7 @@ use bdk_chain::{
 use bdk_esplora::{esplora_client, EsploraExt};
 use example_cli::{
     anyhow::{self, Context},
+    bdk_chain,
     clap::{self, Parser, Subcommand},
     ChangeSet, Keychain,
 };

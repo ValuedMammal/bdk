@@ -16,7 +16,7 @@ use bdk_chain::{
     local_chain, Merge,
 };
 use example_cli::{
-    anyhow,
+    anyhow, bdk_chain,
     clap::{self, Args, Subcommand},
     ChangeSet, Keychain,
 };

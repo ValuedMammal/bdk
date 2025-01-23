@@ -14,6 +14,7 @@ use bdk_electrum::{
 use example_cli::{
     self,
     anyhow::{self, Context},
+    bdk_chain,
     clap::{self, Parser, Subcommand},
     ChangeSet, Keychain,
 };

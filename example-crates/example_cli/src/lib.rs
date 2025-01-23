@@ -34,6 +34,8 @@ use bdk_file_store::Store;
 use clap::{Parser, Subcommand};
 use rand::prelude::*;
 
+pub extern crate bdk_chain;
+
 pub use anyhow;
 pub use clap;
 
