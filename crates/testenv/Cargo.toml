@@ -23,9 +23,8 @@ electrsd = { version = "0.28.0", features = ["legacy"], default-features = false
 bdk_testenv = { path = "." }
 
 [features]
-default = ["std", "download"]
+default = ["download", "bdk_chain/default"]
 download = ["electrsd/bitcoind_25_0", "electrsd/esplora_a33e97e1"]
-std = ["bdk_chain/std"]
 serde = ["bdk_chain/serde"]
 
 [package.metadata.docs.rs]
