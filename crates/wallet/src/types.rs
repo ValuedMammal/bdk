@@ -10,11 +10,12 @@
 // licenses.
 
 use alloc::boxed::Box;
-use chain::{ChainPosition, ConfirmationBlockTime};
 use core::convert::AsRef;
 
+use bdk_coin_select::Candidate;
 use bitcoin::transaction::{OutPoint, Sequence, TxOut};
 use bitcoin::{psbt, Weight};
+use chain::{ChainPosition, ConfirmationBlockTime, FullTxOut};
 
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,24 @@ pub struct LocalOutput {
     pub chain_position: ChainPosition<ConfirmationBlockTime>,
 }
 
+impl LocalOutput {
+    /// New from indexed [`FullTxOut`]
+    pub fn from_indexed_txout(
+        index: (KeychainKind, u32),
+        txout: FullTxOut<ConfirmationBlockTime>,
+    ) -> Self {
+        let (keychain, derivation_index) = index;
+        Self {
+            outpoint: txout.outpoint,
+            txout: txout.txout,
+            keychain,
+            is_spent: txout.spent_by.is_some(),
+            derivation_index,
+            chain_position: txout.chain_position,
+        }
+    }
+}
+
 /// A [`Utxo`] with its `satisfaction_weight`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedUtxo {
@@ -75,6 +94,17 @@ pub struct WeightedUtxo {
     pub satisfaction_weight: Weight,
     /// The UTXO
     pub utxo: Utxo,
+}
+
+impl From<WeightedUtxo> for Candidate {
+    fn from(u: WeightedUtxo) -> Self {
+        Self {
+            input_count: 1,
+            weight: u.satisfaction_weight.to_wu(),
+            value: u.utxo.txout().value.to_sat(),
+            is_segwit: u.utxo.txout().script_pubkey.witness_version().is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

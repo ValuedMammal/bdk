@@ -43,6 +43,21 @@ impl fmt::Display for MiniscriptPsbtError {
 #[cfg(feature = "std")]
 impl std::error::Error for MiniscriptPsbtError {}
 
+/// Plan
+#[derive(Debug)]
+pub struct PlanError(
+    pub(crate) miniscript::descriptor::Descriptor<miniscript::descriptor::DefiniteDescriptorKey>,
+);
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to create plan for descriptor {}", self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PlanError {}
+
 #[derive(Debug)]
 /// Error returned from [`TxBuilder::finish`]
 ///
@@ -88,6 +103,8 @@ pub enum CreateTxError {
     OutputBelowDustLimit(usize),
     /// There was an error with coin selection
     CoinSelection(coin_selection::InsufficientFunds),
+    /// coin_select insufficient funds
+    Selection(bdk_coin_select::InsufficientFunds),
     /// Cannot build a tx without recipients
     NoRecipients,
     /// Partially signed bitcoin transaction error
@@ -104,6 +121,12 @@ pub enum CreateTxError {
     MissingNonWitnessUtxo(OutPoint),
     /// Miniscript PSBT error
     MiniscriptPsbt(MiniscriptPsbtError),
+    /// Error when building a transaction
+    TxBuilder(bdk_tx::Error),
+    /// Error updating a PSBT
+    PsbtUpdate(bdk_tx::UpdatePsbtError),
+    /// Error creating a spending plan
+    Plan(PlanError),
 }
 
 impl fmt::Display for CreateTxError {
@@ -155,6 +178,7 @@ impl fmt::Display for CreateTxError {
                 write!(f, "Output below the dust limit: {}", limit)
             }
             CreateTxError::CoinSelection(e) => e.fmt(f),
+            CreateTxError::Selection(e) => e.fmt(f),
             CreateTxError::NoRecipients => {
                 write!(f, "Cannot build tx without recipients")
             }
@@ -171,6 +195,9 @@ impl fmt::Display for CreateTxError {
             CreateTxError::MiniscriptPsbt(err) => {
                 write!(f, "Miniscript PSBT error: {}", err)
             }
+            CreateTxError::TxBuilder(e) => e.fmt(f),
+            CreateTxError::PsbtUpdate(e) => e.fmt(f),
+            CreateTxError::Plan(e) => e.fmt(f),
         }
     }
 }

@@ -36,17 +36,18 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::fmt;
 
-use alloc::sync::Arc;
-
+use bdk_coin_select::DrainWeights;
+use bdk_tx::Finalizer;
 use bitcoin::psbt::{self, Psbt};
 use bitcoin::script::PushBytes;
 use bitcoin::{
     absolute, transaction::Version, Amount, FeeRate, OutPoint, ScriptBuf, Sequence, Transaction,
     TxIn, TxOut, Txid, Weight,
 };
+use miniscript::plan::Assets;
 use rand_core::RngCore;
 
 use super::coin_selection::CoinSelectionAlgorithm;
@@ -117,35 +118,55 @@ pub struct TxBuilder<'a, Cs> {
 
 /// The parameters for transaction creation sans coin selection algorithm.
 //TODO: TxParams should eventually be exposed publicly.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug)]
 pub(crate) struct TxParams {
+    // inputs
+    pub(crate) utxos: HashSet<LocalOutput>,
+    pub(crate) foreign_utxos: Vec<WeightedUtxo>,
+    // outputs
     pub(crate) recipients: Vec<(ScriptBuf, Amount)>,
-    pub(crate) drain_wallet: bool,
     pub(crate) drain_to: Option<ScriptBuf>,
-    pub(crate) fee_policy: Option<FeePolicy>,
-    pub(crate) internal_policy_path: Option<BTreeMap<String, Vec<usize>>>,
+    // selection
+    pub(crate) assets: Option<Assets>,
     pub(crate) external_policy_path: Option<BTreeMap<String, Vec<usize>>>,
-    pub(crate) utxos: Vec<WeightedUtxo>,
+    pub(crate) internal_policy_path: Option<BTreeMap<String, Vec<usize>>>,
     pub(crate) unspendable: HashSet<OutPoint>,
     pub(crate) manually_selected_only: bool,
-    pub(crate) sighash: Option<psbt::PsbtSighashType>,
-    pub(crate) ordering: TxOrdering,
-    pub(crate) locktime: Option<absolute::LockTime>,
-    pub(crate) sequence: Option<Sequence>,
-    pub(crate) version: Option<Version>,
     pub(crate) change_policy: ChangeSpendPolicy,
-    pub(crate) only_witness_utxo: bool,
-    pub(crate) add_global_xpubs: bool,
-    pub(crate) include_output_redeem_witness_script: bool,
-    pub(crate) bumping_fee: Option<PreviousFee>,
+    pub(crate) coin_selection: CoinSelectionStrategy,
+
+    // create tx
+    pub(crate) version: Option<Version>,
+    pub(crate) locktime: Option<absolute::LockTime>,
     pub(crate) current_height: Option<absolute::LockTime>,
+    pub(crate) fee_policy: Option<FeePolicy>,
+    pub(crate) sequence: Option<Sequence>,
+    pub(crate) ordering: TxOrdering,
+    pub(crate) bumping_fee: Option<PreviousFee>,
+    pub(crate) drain_weights: Option<DrainWeights>,
+    pub(crate) drain_wallet: bool,
     pub(crate) allow_dust: bool,
+    // update psbt
+    pub(crate) include_output_redeem_witness_script: bool,
+    pub(crate) update_with_descriptor: bool,
+    pub(crate) add_global_xpubs: bool,
+    pub(crate) only_witness_utxo: bool,
+    pub(crate) sighash: Option<psbt::PsbtSighashType>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PreviousFee {
     pub absolute: Amount,
     pub rate: FeeRate,
+}
+
+impl Default for PreviousFee {
+    fn default() -> Self {
+        Self {
+            absolute: Amount::ZERO,
+            rate: FeeRate::ZERO,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -274,27 +295,14 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     /// These have priority over the "unspendable" utxos, meaning that if a utxo is present both in
     /// the "utxos" and the "unspendable" list, it will be spent.
     pub fn add_utxos(&mut self, outpoints: &[OutPoint]) -> Result<&mut Self, AddUtxoError> {
-        {
-            let wallet = &mut self.wallet;
-            let utxos = outpoints
+        let outputs = self.wallet.list_output().collect::<Vec<_>>();
+        for outpoint in outpoints {
+            let output = outputs
                 .iter()
-                .map(|outpoint| {
-                    wallet
-                        .get_utxo(*outpoint)
-                        .ok_or(AddUtxoError::UnknownUtxo(*outpoint))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            for utxo in utxos {
-                let descriptor = wallet.public_descriptor(utxo.keychain);
-                let satisfaction_weight = descriptor.max_weight_to_satisfy().unwrap();
-                self.params.utxos.push(WeightedUtxo {
-                    satisfaction_weight,
-                    utxo: Utxo::Local(utxo),
-                });
-            }
+                .find(|out| out.outpoint == *outpoint)
+                .ok_or(AddUtxoError::UnknownUtxo(*outpoint))?;
+            self.params.utxos.insert(output.clone());
         }
-
         Ok(self)
     }
 
@@ -393,7 +401,7 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
             }
         }
 
-        self.params.utxos.push(WeightedUtxo {
+        self.params.foreign_utxos.push(WeightedUtxo {
             satisfaction_weight,
             utxo: Utxo::Foreign {
                 outpoint,
@@ -493,6 +501,19 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
         self
     }
 
+    /// Use the descriptor to update as many fields of a PSBT input as we can.
+    ///
+    /// By default we try to update the PSBT fields that we have data for and which may be
+    /// needed to complete a given spend plan. This option may be used to exhaustively update
+    /// the input while doing additonal validation. See [`update_input_with_descriptor`] for
+    /// more details.
+    ///
+    /// [`update_input_with_descriptor`]: miniscript::psbt::PsbtExt::update_input_with_descriptor
+    pub fn update_with_descriptor(&mut self) -> &mut Self {
+        self.params.update_with_descriptor = true;
+        self
+    }
+
     /// Only Fill-in the [`psbt::Input::witness_utxo`](bitcoin::psbt::Input::witness_utxo) field when spending from
     /// SegWit descriptors.
     ///
@@ -541,6 +562,12 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
         }
     }
 
+    /// Set the coin selection strategy
+    pub fn selection_strategy(&mut self, coin_select: CoinSelectionStrategy) -> &mut Self {
+        self.params.coin_selection = coin_select;
+        self
+    }
+
     /// Set an exact nSequence value
     ///
     /// This can cause conflicts if the wallet's descriptors contain an
@@ -561,6 +588,7 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     ///    manually add them using [`TxBuilder::add_utxos`].
     ///
     /// In both cases, if you don't provide a current height, we use the last sync height.
+    // TODO: consider deprecating this in favor of `TxBuilder::add_assets`
     pub fn current_height(&mut self, height: u32) -> &mut Self {
         self.params.current_height =
             Some(absolute::LockTime::from_height(height).expect("Invalid height"));
@@ -591,6 +619,12 @@ impl<'a, Cs> TxBuilder<'a, Cs> {
     pub fn add_data<T: AsRef<PushBytes>>(&mut self, data: &T) -> &mut Self {
         let script = ScriptBuf::new_op_return(data);
         self.add_recipient(script, Amount::ZERO);
+        self
+    }
+
+    /// Set the [`DrainWeights`].
+    pub fn drain_weights(&mut self, drain_weights: DrainWeights) -> &mut Self {
+        self.params.drain_weights = Some(drain_weights);
         self
     }
 
@@ -673,6 +707,27 @@ impl<Cs: CoinSelectionAlgorithm> TxBuilder<'_, Cs> {
     pub fn finish_with_aux_rand(self, rng: &mut impl RngCore) -> Result<Psbt, CreateTxError> {
         self.wallet.create_tx(self.coin_selection, self.params, rng)
     }
+
+    /// Finish building the transaction and return a [`Psbt`] and [`Finalizer`].
+    #[cfg(feature = "std")]
+    pub fn build_psbt(self) -> Result<(Psbt, Finalizer), CreateTxError> {
+        self.wallet
+            .build_psbt(self.params, &mut bitcoin::key::rand::thread_rng())
+    }
+}
+
+/// Coin selection strategy
+#[derive(Debug, Copy, Clone, Default)]
+pub enum CoinSelectionStrategy {
+    /// Branch and bound (default)
+    #[default]
+    BranchAndBound,
+    /// Largest first
+    LargestFirst,
+    /// Oldest first
+    OldestFirst,
+    /// Single random draw
+    SingleRandomDraw,
 }
 
 #[derive(Debug)]
