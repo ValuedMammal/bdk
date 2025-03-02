@@ -117,7 +117,9 @@ impl<T> Selector<'_, T> {
         }
 
         if selector.unselected().next().is_none() {
-            let value_sum = selector.selected_value() - change_policy.min_value;
+            let value_sum = selector
+                .selected_value()
+                .saturating_sub(change_policy.min_value);
             let mut trg = target;
             if let TargetOutputs {
                 value_sum: 0,
@@ -127,7 +129,7 @@ impl<T> Selector<'_, T> {
             {
                 // All candidates are selected but we have no recipients, which means we
                 // could be doing a sweep. We treat the drain as a recipient in the next
-                // calculation, if the implied fee given the target exceeds the total value,
+                // calculation. If the implied fee given the target exceeds the total value,
                 // then we fail selection. This can happen if the feerate is high enough to
                 // consume the entire drain amount.
                 trg.outputs = TargetOutputs {
