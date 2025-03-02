@@ -18,6 +18,7 @@ use crate::{descriptor, KeychainKind};
 use alloc::string::String;
 use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, Txid};
 use core::fmt;
+use miniscript::{descriptor::DefiniteDescriptorKey, Descriptor};
 
 /// Errors returned by miniscript when updating inconsistent PSBTs
 #[derive(Debug, Clone)]
@@ -42,6 +43,19 @@ impl fmt::Display for MiniscriptPsbtError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for MiniscriptPsbtError {}
+
+/// Error when trying to create a spending [`Plan`](miniscript::plan::Plan).
+#[derive(Debug)]
+pub struct PlanError(pub(crate) Descriptor<DefiniteDescriptorKey>);
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to create plan for descriptor {}", self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PlanError {}
 
 #[derive(Debug)]
 /// Error returned from [`TxBuilder::finish`]
@@ -88,6 +102,8 @@ pub enum CreateTxError {
     OutputBelowDustLimit(usize),
     /// There was an error with coin selection
     CoinSelection(coin_selection::InsufficientFunds),
+    /// bdk_coin_select insufficient funds
+    Selection(bdk_coin_select::InsufficientFunds),
     /// Cannot build a tx without recipients
     NoRecipients,
     /// Partially signed bitcoin transaction error
@@ -104,6 +120,12 @@ pub enum CreateTxError {
     MissingNonWitnessUtxo(OutPoint),
     /// Miniscript PSBT error
     MiniscriptPsbt(MiniscriptPsbtError),
+    /// Error when building a transaction
+    BuildPsbt(bdk_tx::Error),
+    /// Error updating a PSBT
+    UpdatePsbt(bdk_tx::UpdatePsbtError),
+    /// Error creating a spending plan
+    Plan(PlanError),
 }
 
 impl fmt::Display for CreateTxError {
@@ -155,6 +177,7 @@ impl fmt::Display for CreateTxError {
                 write!(f, "Output below the dust limit: {}", limit)
             }
             CreateTxError::CoinSelection(e) => e.fmt(f),
+            CreateTxError::Selection(e) => e.fmt(f),
             CreateTxError::NoRecipients => {
                 write!(f, "Cannot build tx without recipients")
             }
@@ -171,6 +194,9 @@ impl fmt::Display for CreateTxError {
             CreateTxError::MiniscriptPsbt(err) => {
                 write!(f, "Miniscript PSBT error: {}", err)
             }
+            CreateTxError::BuildPsbt(e) => e.fmt(f),
+            CreateTxError::UpdatePsbt(e) => e.fmt(f),
+            CreateTxError::Plan(e) => e.fmt(f),
         }
     }
 }

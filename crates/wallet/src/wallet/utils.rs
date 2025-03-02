@@ -9,12 +9,47 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+use bdk_tx::DataProvider;
 use bitcoin::secp256k1::{All, Secp256k1};
-use bitcoin::{absolute, relative, Amount, Script, Sequence};
-
-use miniscript::{MiniscriptKey, Satisfier, ToPublicKey};
-
+use bitcoin::{absolute, relative, Amount, Script, Sequence, Transaction, TxOut, Txid};
+use miniscript::{
+    plan::Assets, DefiniteDescriptorKey, Descriptor, MiniscriptKey, Satisfier, ToPublicKey,
+};
 use rand_core::RngCore;
+
+use crate::{TxOrdering, Wallet};
+
+/// Structure that acts as a data provider when creating transactions.
+pub(super) struct Provider<'a> {
+    pub wallet: &'a Wallet,
+    pub tx_order: (TxOrdering, &'a mut dyn RngCore),
+}
+
+impl DataProvider for Provider<'_> {
+    fn get_tx(&self, txid: Txid) -> Option<Transaction> {
+        self.wallet
+            .tx_graph()
+            .get_tx(txid)
+            .map(|tx| tx.as_ref().clone())
+    }
+
+    fn get_descriptor_for_txout(&self, txout: &TxOut) -> Option<Descriptor<DefiniteDescriptorKey>> {
+        self.wallet
+            .spk_index()
+            .index_of_spk(txout.script_pubkey.clone())
+            .map(|&(keychain, index)| {
+                self.wallet
+                    .public_descriptor(keychain)
+                    .at_derivation_index(index)
+                    .expect("must be valid index")
+            })
+    }
+
+    fn sort_transaction(&mut self, tx: &mut Transaction) {
+        let tx_order = self.tx_order.0.clone();
+        tx_order.sort_tx_with_aux_rand(tx, &mut self.tx_order.1);
+    }
+}
 
 /// Trait to check if a value is below the dust limit.
 /// We are performing dust value calculation for a given script public key using rust-bitcoin to
@@ -132,6 +167,30 @@ pub(crate) fn shuffle_slice<T>(list: &mut [T], rng: &mut impl RngCore) {
 }
 
 pub(crate) type SecpCtx = Secp256k1<All>;
+
+/// Trait that extends [`Assets`]
+pub(crate) trait AssetsExt {
+    /// Extend `self` with the contents of other
+    fn extend(&mut self, other: &Self);
+}
+
+impl AssetsExt for Assets {
+    /// Extend `self` with the contents of other. Note that if present, this preferentially
+    /// uses the absolute and relative timelocks of `other`.
+    fn extend(&mut self, other: &Self) {
+        self.keys.extend(other.keys.clone());
+        self.sha256_preimages.extend(other.sha256_preimages.clone());
+        self.hash256_preimages
+            .extend(other.hash256_preimages.clone());
+        self.ripemd160_preimages
+            .extend(other.ripemd160_preimages.clone());
+        self.hash160_preimages
+            .extend(other.hash160_preimages.clone());
+
+        self.absolute_timelock = other.absolute_timelock.or(self.absolute_timelock);
+        self.relative_timelock = other.relative_timelock.or(self.relative_timelock);
+    }
+}
 
 #[cfg(test)]
 mod test {

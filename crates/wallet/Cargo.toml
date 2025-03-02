@@ -22,6 +22,8 @@ bitcoin = { version = "0.32.0", features = [ "serde", "base64" ], default-featur
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 bdk_chain = { path = "../chain", version = "0.21.1", features = [ "miniscript", "serde" ], default-features = false }
+bdk_coin_select = "0.4"
+bdk_tx = { git = "https://github.com/bitcoindevkit/bdk-tx", branch = "feat/add-psbt-input" }
 bdk_file_store = { path = "../file_store", version = "0.18.1", optional = true }
 
 # Optional dependencies
