@@ -18,6 +18,7 @@ use crate::{descriptor, KeychainKind};
 use alloc::string::String;
 use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, Txid};
 use core::fmt;
+use miniscript::{descriptor::DefiniteDescriptorKey, Descriptor};
 
 /// Errors returned by miniscript when updating inconsistent PSBTs
 #[derive(Debug, Clone)]
@@ -42,6 +43,19 @@ impl fmt::Display for MiniscriptPsbtError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for MiniscriptPsbtError {}
+
+/// Error when trying to create a spending [`Plan`](miniscript::plan::Plan).
+#[derive(Debug)]
+pub struct PlanError(pub(crate) Descriptor<DefiniteDescriptorKey>);
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unable to create plan for descriptor {}", self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PlanError {}
 
 #[derive(Debug)]
 /// Error returned from [`TxBuilder::finish`]
@@ -253,3 +267,53 @@ impl fmt::Display for BuildFeeBumpError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for BuildFeeBumpError {}
+
+/// Error for [`TxBuilder::finish_psbt`]
+///
+/// [`TxBuilder::finish_psbt`]: crate::TxBuilder::finish_psbt
+#[derive(Debug)]
+pub enum BuildPsbtError {
+    /// Error when building the PSBT
+    BuildPsbt(bdk_tx::Error),
+    /// coin_select insufficient funds
+    CoinSelect(bdk_coin_select::InsufficientFunds),
+    /// errors pertaining to tx creation parameters
+    CreateTx(CreateTxError),
+    /// Error creating a spending plan
+    Plan(PlanError),
+    /// bitcoin psbt error
+    Psbt(psbt::Error),
+}
+
+impl fmt::Display for BuildPsbtError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BuildPsbt(e) => e.fmt(f),
+            Self::CoinSelect(e) => e.fmt(f),
+            Self::CreateTx(e) => e.fmt(f),
+            Self::Plan(e) => e.fmt(f),
+            Self::Psbt(e) => e.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BuildPsbtError {}
+
+impl From<bdk_coin_select::InsufficientFunds> for BuildPsbtError {
+    fn from(e: bdk_coin_select::InsufficientFunds) -> Self {
+        Self::CoinSelect(e)
+    }
+}
+
+impl From<bdk_tx::Error> for BuildPsbtError {
+    fn from(e: bdk_tx::Error) -> Self {
+        Self::BuildPsbt(e)
+    }
+}
+
+impl From<psbt::Error> for BuildPsbtError {
+    fn from(e: psbt::Error) -> Self {
+        Self::Psbt(e)
+    }
+}

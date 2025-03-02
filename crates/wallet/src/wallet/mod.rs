@@ -31,13 +31,14 @@ use bdk_chain::{
     },
     tx_graph::{CalculateFeeError, CanonicalTx, TxGraph, TxUpdate},
     BlockId, ChainPosition, ConfirmationBlockTime, DescriptorExt, FullTxOut, Indexed,
-    IndexedTxGraph, Indexer, Merge,
+    IndexedTxGraph, Indexer, KeychainIndexed, Merge,
 };
+use bdk_tx::{Finalizer, UpdateOptions};
 use bitcoin::{
     absolute,
     consensus::encode::serialize,
     constants::genesis_block,
-    psbt,
+    psbt, relative,
     secp256k1::Secp256k1,
     sighash::{EcdsaSighashType, TapSighashType},
     transaction, Address, Amount, Block, BlockHash, FeeRate, Network, OutPoint, Psbt, ScriptBuf,
@@ -45,11 +46,14 @@ use bitcoin::{
 };
 use miniscript::{
     descriptor::KeyMap,
+    plan::{Assets, Plan},
     psbt::{PsbtExt, PsbtInputExt, PsbtInputSatisfier},
+    ForEachKey,
 };
 use rand_core::RngCore;
 
 mod changeset;
+mod coin_select;
 pub mod coin_selection;
 pub mod error;
 pub mod export;
@@ -68,11 +72,12 @@ use crate::descriptor::{
 use crate::psbt::PsbtUtils;
 use crate::types::*;
 use crate::wallet::{
+    coin_select::CoinSelector,
     coin_selection::{DefaultCoinSelectionAlgorithm, Excess, InsufficientFunds},
-    error::{BuildFeeBumpError, CreateTxError, MiniscriptPsbtError},
+    error::{BuildFeeBumpError, BuildPsbtError, CreateTxError, MiniscriptPsbtError, PlanError},
     signer::{SignOptions, SignerError, SignerOrdering, SignersContainer, TransactionSigner},
-    tx_builder::{FeePolicy, TxBuilder, TxParams},
-    utils::{check_nsequence_rbf, After, Older, SecpCtx},
+    tx_builder::{FeePolicy, PreviousFee, TxBuilder, TxParams},
+    utils::{check_nsequence_rbf, After, AssetsExt, Older, Provider, SecpCtx},
 };
 
 // re-exports
@@ -809,29 +814,38 @@ impl Wallet {
         self.indexed_graph.index.index_of_spk(spk).cloned()
     }
 
-    /// Return the list of unspent outputs of this wallet
-    pub fn list_unspent(&self) -> impl Iterator<Item = LocalOutput> + '_ {
-        self.indexed_graph
-            .graph()
-            .filter_chain_unspents(
-                &self.chain,
-                self.chain.tip().block_id(),
-                self.indexed_graph.index.outpoints().iter().cloned(),
-            )
-            .map(|((k, i), full_txo)| new_local_utxo(k, i, full_txo))
+    /// List indexed full txouts of this wallet
+    fn list_full_txouts(
+        &self,
+    ) -> impl Iterator<Item = KeychainIndexed<KeychainKind, FullTxOut<ConfirmationBlockTime>>> + '_
+    {
+        self.indexed_graph.graph().filter_chain_txouts(
+            &self.chain,
+            self.chain.tip().block_id(),
+            self.indexed_graph.index.outpoints().iter().cloned(),
+        )
+    }
+
+    /// List indexed full txouts that are unspent
+    fn list_unspent_txouts(
+        &self,
+    ) -> impl Iterator<Item = KeychainIndexed<KeychainKind, FullTxOut<ConfirmationBlockTime>>> + '_
+    {
+        self.list_full_txouts()
+            .filter(|(_, txo)| txo.spent_by.is_none())
     }
 
     /// List all relevant outputs (includes both spent and unspent, confirmed and unconfirmed).
     ///
     /// To list only unspent outputs (UTXOs), use [`Wallet::list_unspent`] instead.
     pub fn list_output(&self) -> impl Iterator<Item = LocalOutput> + '_ {
-        self.indexed_graph
-            .graph()
-            .filter_chain_txouts(
-                &self.chain,
-                self.chain.tip().block_id(),
-                self.indexed_graph.index.outpoints().iter().cloned(),
-            )
+        self.list_full_txouts()
+            .map(|((k, i), full_txo)| new_local_utxo(k, i, full_txo))
+    }
+
+    /// Return the list of unspent outputs of this wallet
+    pub fn list_unspent(&self) -> impl Iterator<Item = LocalOutput> + '_ {
+        self.list_unspent_txouts()
             .map(|((k, i), full_txo)| new_local_utxo(k, i, full_txo))
     }
 
@@ -1292,15 +1306,15 @@ impl Wallet {
             None => transaction::Version::TWO,
         };
 
-        // We use a match here instead of a unwrap_or_else as it's way more readable :)
-        let current_height = match params.current_height {
-            // If they didn't tell us the current height, we assume it's the latest sync height.
-            None => {
-                let tip_height = self.chain.tip().height();
-                absolute::LockTime::from_height(tip_height).expect("invalid height")
+        let mut current_height =
+            absolute::LockTime::from_consensus(self.latest_checkpoint().height());
+        if let Some(assets) = &params.assets {
+            if let Some(lock) = &assets.absolute_timelock {
+                if current_height.is_implied_by(*lock) {
+                    current_height = *lock;
+                }
             }
-            Some(h) => h,
-        };
+        }
 
         let lock_time = match params.locktime {
             // When no nLockTime is specified, we try to prevent fee sniping, if possible
@@ -1420,7 +1434,19 @@ impl Wallet {
         let (required_utxos, optional_utxos) = {
             // NOTE: manual selection overrides unspendable
             let mut required: Vec<WeightedUtxo> = params.utxos.values().cloned().collect();
-            let optional = self.filter_utxos(&params, current_height.to_consensus_u32());
+            let mut optional: Vec<WeightedUtxo> = vec![];
+            if !params.manually_selected_only {
+                let utxos = self
+                    .filter_utxos(&params, current_height.to_consensus_u32())
+                    .map(|output| WeightedUtxo {
+                        satisfaction_weight: self
+                            .public_descriptor(output.keychain)
+                            .max_weight_to_satisfy()
+                            .expect("descriptor should be satisfiable"),
+                        utxo: Utxo::Local(output),
+                    });
+                optional.extend(utxos);
+            }
 
             // if drain_wallet is true, all UTxOs are required
             if params.drain_wallet {
@@ -1625,72 +1651,62 @@ impl Wallet {
             .calculate_fee_rate(&tx)
             .map_err(|_| BuildFeeBumpError::FeeRateUnavailable)?;
 
-        // remove the inputs from the tx and process them
-        let utxos = tx
+        // Remove the inputs from the tx and process them
+        let utxos: HashMap<OutPoint, WeightedUtxo> = tx
             .input
             .drain(..)
             .map(|txin| -> Result<_, BuildFeeBumpError> {
-                graph
-                    // Get previous transaction
+                let prev_tx = graph
                     .get_tx(txin.previous_output.txid)
-                    .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))
-                    // Get chain position
-                    .and_then(|prev_tx| {
-                        chain_positions
+                    .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))?;
+                let txout = &prev_tx.output[txin.previous_output.vout as usize];
+                let utxo = match txout_index.index_of_spk(txout.script_pubkey.clone()) {
+                    Some(&(keychain, derivation_index)) => {
+                        let chain_position = chain_positions
                             .get(&txin.previous_output.txid)
                             .cloned()
-                            .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))
-                            .map(|chain_position| (prev_tx, chain_position))
-                    })
-                    .map(|(prev_tx, chain_position)| {
-                        let txout = prev_tx.output[txin.previous_output.vout as usize].clone();
-                        match txout_index.index_of_spk(txout.script_pubkey.clone()) {
-                            Some(&(keychain, derivation_index)) => (
-                                txin.previous_output,
-                                WeightedUtxo {
-                                    satisfaction_weight: self
-                                        .public_descriptor(keychain)
-                                        .max_weight_to_satisfy()
-                                        .unwrap(),
-                                    utxo: Utxo::Local(LocalOutput {
-                                        outpoint: txin.previous_output,
-                                        txout: txout.clone(),
-                                        keychain,
-                                        is_spent: true,
-                                        derivation_index,
-                                        chain_position,
-                                    }),
-                                },
-                            ),
-                            None => {
-                                let satisfaction_weight = Weight::from_wu_usize(
-                                    serialize(&txin.script_sig).len() * 4
-                                        + serialize(&txin.witness).len(),
-                                );
-
-                                (
-                                    txin.previous_output,
-                                    WeightedUtxo {
-                                        utxo: Utxo::Foreign {
-                                            outpoint: txin.previous_output,
-                                            sequence: txin.sequence,
-                                            psbt_input: Box::new(psbt::Input {
-                                                witness_utxo: txout
-                                                    .script_pubkey
-                                                    .witness_version()
-                                                    .map(|_| txout.clone()),
-                                                non_witness_utxo: Some(prev_tx.as_ref().clone()),
-                                                ..Default::default()
-                                            }),
-                                        },
-                                        satisfaction_weight,
-                                    },
-                                )
-                            }
+                            .ok_or(BuildFeeBumpError::UnknownUtxo(txin.previous_output))?;
+                        let satisfaction_weight = self
+                            .public_descriptor(keychain)
+                            .max_weight_to_satisfy()
+                            .expect("descriptor should be satisfiable");
+                        WeightedUtxo {
+                            satisfaction_weight,
+                            utxo: Utxo::Local(LocalOutput {
+                                outpoint: txin.previous_output,
+                                txout: txout.clone(),
+                                keychain,
+                                is_spent: true,
+                                derivation_index,
+                                chain_position,
+                            }),
                         }
-                    })
+                    }
+                    None => {
+                        let satisfaction_weight = Weight::from_wu_usize(
+                            serialize(&txin.script_sig).len() * 4 + serialize(&txin.witness).len(),
+                        );
+                        WeightedUtxo {
+                            satisfaction_weight,
+                            utxo: Utxo::Foreign {
+                                outpoint: txin.previous_output,
+                                sequence: txin.sequence,
+                                psbt_input: Box::new(psbt::Input {
+                                    witness_utxo: txout
+                                        .script_pubkey
+                                        .witness_version()
+                                        .map(|_| txout.clone()),
+                                    non_witness_utxo: Some(prev_tx.as_ref().clone()),
+                                    ..Default::default()
+                                }),
+                            },
+                        }
+                    }
+                };
+
+                Ok((txin.previous_output, utxo))
             })
-            .collect::<Result<HashMap<OutPoint, WeightedUtxo>, BuildFeeBumpError>>()?;
+            .collect::<Result<HashMap<_, _>, _>>()?;
 
         if tx.output.len() > 1 {
             let mut change_index = None;
@@ -1710,7 +1726,6 @@ impl Wallet {
         }
 
         let params = TxParams {
-            // TODO: figure out what rbf option should be?
             version: Some(tx.version),
             recipients: tx
                 .output
@@ -1995,52 +2010,29 @@ impl Wallet {
         descriptor.at_derivation_index(child).ok()
     }
 
-    /// Given the options returns the list of utxos that must be used to form the
-    /// transaction and any further that may be used if needed.
-    fn filter_utxos(&self, params: &TxParams, current_height: u32) -> Vec<WeightedUtxo> {
-        if params.manually_selected_only {
-            vec![]
-        // only process optional UTxOs if manually_selected_only is false
-        } else {
-            self.indexed_graph
-                .graph()
-                // get all unspent UTxOs from wallet
-                // NOTE: the UTxOs returned by the following method already belong to wallet as the
-                // call chain uses get_tx_node infallibly
-                .filter_chain_unspents(
-                    &self.chain,
-                    self.chain.tip().block_id(),
-                    self.indexed_graph.index.outpoints().iter().cloned(),
-                )
-                // only create LocalOutput if UTxO is mature
-                .filter_map(move |((k, i), full_txo)| {
-                    full_txo
-                        .is_mature(current_height)
-                        .then(|| new_local_utxo(k, i, full_txo))
-                })
-                // only process UTxOs not selected manually, they will be considered later in the chain
-                // NOTE: this avoid UTxOs in both required and optional list
-                .filter(|may_spend| !params.utxos.contains_key(&may_spend.outpoint))
-                // only add to optional UTxOs those which satisfy the change policy if we reuse change
-                .filter(|local_output| {
-                    self.keychains().count() == 1
-                        || params.change_policy.is_satisfied_by(local_output)
-                })
-                // only add to optional UTxOs those marked as spendable
-                .filter(|local_output| !params.unspendable.contains(&local_output.outpoint))
-                // if bumping fees only add to optional UTxOs those confirmed
-                .filter(|local_output| {
-                    params.bumping_fee.is_none() || local_output.chain_position.is_confirmed()
-                })
-                .map(|utxo| WeightedUtxo {
-                    satisfaction_weight: self
-                        .public_descriptor(utxo.keychain)
-                        .max_weight_to_satisfy()
-                        .unwrap(),
-                    utxo: Utxo::Local(utxo),
-                })
-                .collect()
-        }
+    /// Return a list of unspent outputs filtered by the selection constraints of the `params`.
+    fn filter_utxos<'a>(
+        &'a self,
+        params: &'a TxParams,
+        current_height: u32,
+    ) -> impl Iterator<Item = LocalOutput> + 'a {
+        self.list_unspent_txouts()
+            .filter_map(move |((k, i), full_txo)| {
+                full_txo
+                    .is_mature(current_height)
+                    .then(|| new_local_utxo(k, i, full_txo))
+            })
+            // only process UTxOs not selected manually, they will be considered later in the chain
+            // NOTE: this avoid UTxOs in both required and optional list
+            .filter(|output| !params.utxos.contains_key(&output.outpoint))
+            // only add to optional UTxOs those which satisfy the change policy if we reuse change
+            .filter(|output| {
+                self.keychains().count() == 1 || params.change_policy.is_satisfied_by(output)
+            })
+            // only add to optional UTxOs those marked as spendable
+            .filter(|output| !params.unspendable.contains(&output.outpoint))
+            // if bumping fees only add to optional UTxOs those confirmed
+            .filter(|output| params.bumping_fee.is_none() || output.chain_position.is_confirmed())
     }
 
     fn complete_transaction(
@@ -2198,6 +2190,37 @@ impl Wallet {
         }
 
         Ok(())
+    }
+
+    /// Try to create a plan for the given output and spend assets
+    pub fn try_plan(&self, output: &LocalOutput, spend_assets: &Assets) -> Result<Plan, PlanError> {
+        let cur_height = self.latest_checkpoint().height();
+        let abs_locktime = spend_assets
+            .absolute_timelock
+            .unwrap_or(absolute::LockTime::from_consensus(cur_height));
+
+        let desc = self.public_descriptor(output.keychain);
+        let def_desc = desc
+            .at_derivation_index(output.derivation_index)
+            .expect("valid derivation index");
+        let rel_locktime = spend_assets.relative_timelock.unwrap_or_else(|| {
+            let n_confs = match output.chain_position {
+                ChainPosition::Confirmed { anchor, .. } => cur_height
+                    .saturating_add(1)
+                    .saturating_sub(anchor.block_id.height)
+                    .try_into()
+                    .unwrap_or(u16::MAX),
+                ChainPosition::Unconfirmed { .. } => 0,
+            };
+            relative::LockTime::from_height(n_confs)
+        });
+
+        let mut assets = Assets::new();
+        assets.extend(spend_assets);
+        assets = assets.after(abs_locktime);
+        assets = assets.older(rel_locktime);
+
+        def_desc.plan(&assets).map_err(PlanError)
     }
 
     /// Return the checksum of the public descriptor associated to `keychain`
@@ -2425,6 +2448,361 @@ impl Wallet {
     }
 }
 
+impl Wallet {
+    /// Collect all the `keys` assets from the wallet
+    fn assets(&self) -> Assets {
+        let mut pk = vec![];
+        for (_, desc) in self.keychains() {
+            desc.for_each_key(|k| {
+                pk.push(k.clone());
+                true
+            });
+        }
+        Assets::new().add(pk)
+    }
+
+    /// Build a PSBT with the given `params` and auxiliary randomness.
+    fn build_psbt(
+        &mut self,
+        params: TxParams,
+        rng: &mut impl RngCore,
+    ) -> Result<(Psbt, Finalizer), BuildPsbtError> {
+        let change_keychain = self.keychains().last().expect("must have one").0;
+
+        let mut builder = bdk_tx::Builder::new();
+
+        // Get spend assets
+        let assets = match &params.assets {
+            None => self.assets(),
+            Some(params_assets) => {
+                let mut assets = Assets::new();
+                assets.extend(params_assets);
+                // The presence of a KeySource in `params_assets` indicates a specific
+                // key will later be used to sign. If none are given, then assume all keys
+                // in the descriptor are equally likely to sign.
+                if assets.keys.is_empty() {
+                    assets.extend(&self.assets());
+                }
+                assets
+            }
+        };
+
+        if params.manually_selected_only && params.utxos.is_empty() {
+            return Err(BuildPsbtError::CreateTx(CreateTxError::NoRecipients));
+        }
+
+        let mut current_height =
+            absolute::LockTime::from_consensus(self.latest_checkpoint().height());
+        // Allow modulating the current height by the assets
+        if let Some(lock) = assets.absolute_timelock {
+            if current_height.is_implied_by(lock) {
+                current_height = lock;
+            }
+        }
+
+        let utxos = params.utxos.values().cloned().collect::<Vec<_>>();
+        let local_outputs = utxos
+            .iter()
+            .filter_map(WeightedUtxo::local_output)
+            .collect::<Vec<_>>();
+
+        let mut unspent = self
+            .filter_utxos(&params, current_height.to_consensus_u32())
+            .collect::<Vec<_>>();
+
+        params.utxo_ordering.sort_utxos(&mut unspent, rng);
+
+        let plan_utxos = utxos
+            .iter()
+            .filter_map(WeightedUtxo::local_output)
+            .chain(&unspent)
+            .flat_map(|output| {
+                let plan = self.try_plan(output, &assets).ok()?;
+                Some((output.outpoint, plan))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let version = match params.version {
+            Some(transaction::Version(0)) => {
+                return Err(BuildPsbtError::CreateTx(CreateTxError::Version0))
+            }
+            Some(transaction::Version::ONE) if assets.relative_timelock.is_some() => {
+                return Err(BuildPsbtError::CreateTx(CreateTxError::Version1Csv));
+            }
+            Some(v) => v,
+            None => transaction::Version::TWO,
+        };
+        builder.version(version);
+
+        // use the highest locktime that we're given
+        let locktime = match (params.locktime, assets.absolute_timelock) {
+            (Some(a), Some(b)) if b.to_consensus_u32() > a.to_consensus_u32() => b,
+            (Some(a), _) => a,
+            (None, Some(b)) => b,
+            (None, None) => current_height,
+        };
+
+        builder.locktime(locktime);
+
+        if let Some(sequence) = params.sequence {
+            builder.sequence(sequence);
+        }
+
+        if !params.allow_dust {
+            for (index, (script, amt)) in params.recipients.iter().enumerate() {
+                if amt.is_dust(script) {
+                    return Err(BuildPsbtError::CreateTx(
+                        CreateTxError::OutputBelowDustLimit(index),
+                    ));
+                }
+            }
+        }
+
+        builder.add_outputs(params.recipients.clone());
+
+        // A manually selected local output could not be planned
+        if local_outputs.iter().any(|output| !plan_utxos.contains_key(&output.outpoint))
+            // We have funds available but were unable to create any plans
+            || (plan_utxos.is_empty() && !unspent.is_empty())
+        {
+            // try plans again, this time propagating the error
+            for output in local_outputs.iter().copied().chain(&unspent) {
+                let _ = self
+                    .try_plan(output, &assets)
+                    .map_err(BuildPsbtError::Plan)?;
+            }
+        }
+
+        // We allow no recipients if either `drain_wallet` is set or we have manually
+        // selected coins. In that case the drain output is the only recipient. Otherwise
+        // the transaction can't be built.
+        if params.recipients.is_empty() && !params.drain_wallet && utxos.is_empty() {
+            return Err(BuildPsbtError::CreateTx(CreateTxError::NoRecipients));
+        }
+
+        let fee_policy = params.fee_policy.unwrap_or_default();
+        let is_feerate_policy = matches!(fee_policy, FeePolicy::FeeRate(..));
+        let is_rbf = params.bumping_fee.is_some();
+
+        let PreviousFee {
+            absolute: bumping_fee,
+            rate: bumping_feerate,
+        } = params.bumping_fee.unwrap_or(PreviousFee {
+            absolute: Amount::ZERO,
+            rate: FeeRate::ZERO,
+        });
+
+        // Check that the given FeePolicy meets the matching RBF rule. Later, we
+        // compare the actual fee/feerate of the tx with the previous fee if applicable
+        match fee_policy {
+            FeePolicy::FeeAmount(amount) => {
+                if amount < bumping_fee {
+                    return Err(BuildPsbtError::CreateTx(CreateTxError::FeeTooLow {
+                        required: bumping_fee,
+                    }));
+                }
+            }
+            FeePolicy::FeeRate(feerate) => {
+                let required = FeeRate::from_sat_per_kwu(
+                    bumping_feerate.to_sat_per_kwu() + FeeRate::BROADCAST_MIN.to_sat_per_kwu(),
+                );
+                if feerate < required {
+                    return Err(BuildPsbtError::CreateTx(CreateTxError::FeeRateTooLow {
+                        required,
+                    }));
+                }
+            }
+        }
+
+        let mut drain_index = None;
+        let drain_spk = match params.drain_to {
+            Some(script) => script,
+            None => {
+                // Find the next unused script if any
+                let next_unused = self
+                    .list_unused_addresses(change_keychain)
+                    .next()
+                    .unwrap_or_else(|| {
+                        // ..or get the next script to be revealed.
+                        let (next_index, _) = self
+                            .spk_index()
+                            .next_index(change_keychain)
+                            .expect("keychain must exist");
+                        self.peek_address(change_keychain, next_index)
+                    });
+                drain_index = Some(next_unused.index);
+                next_unused.script_pubkey()
+            }
+        };
+
+        // Prepare candidates from the params and the unspent utxos, while updating
+        // the satisfaction weights. Local candidates must be planned before being
+        // selected. Foreign utxos remain unplanned, as they come weighted already.
+        let mut candidates = utxos;
+        for utxo in candidates.iter_mut() {
+            if let Some(plan) = plan_utxos.get(&utxo.utxo.outpoint()) {
+                utxo.satisfaction_weight = Weight::from_wu_usize(plan.satisfaction_weight());
+            }
+        }
+        candidates.extend(unspent.into_iter().flat_map(|output| {
+            let plan = plan_utxos.get(&output.outpoint)?;
+            Some(WeightedUtxo {
+                satisfaction_weight: Weight::from_wu_usize(plan.satisfaction_weight()),
+                utxo: Utxo::Local(output),
+            })
+        }));
+
+        let mut selector = CoinSelector::new(&candidates, builder.target_outputs());
+        selector.options.order = params.utxo_ordering;
+        if let Some(drain_weights) = params.drain_weights {
+            selector.drain_weights(drain_weights);
+        }
+        let (feerate, fee_amount) = match fee_policy {
+            FeePolicy::FeeRate(rate) => (rate, Amount::ZERO),
+            FeePolicy::FeeAmount(fee) => (FeeRate::ZERO, fee),
+        };
+        if is_feerate_policy {
+            // Set the target feerate
+            selector.feerate(bdk_coin_select::FeeRate::from_sat_per_wu(
+                feerate.to_sat_per_kwu() as f32 / 1000.0,
+            ));
+        } else {
+            // We add the fee to the target amount, so don't factor in a feerate
+            selector.fee_absolute(fee_amount);
+            selector.feerate(bdk_coin_select::FeeRate::from_sat_per_vb(0.0));
+        }
+        // Count of utxos that must be selected
+        selector.options.select_to = if params.drain_wallet {
+            candidates.len()
+        } else {
+            params.utxos.len()
+        };
+        let (selection, drain) = selector.select_coins()?;
+        if drain.is_some() {
+            builder.add_change_output(drain_spk, Amount::from_sat(drain.value));
+            // inform the builder of the expected fee outcome
+            match fee_policy {
+                FeePolicy::FeeAmount(fee) if fee == Amount::ZERO => {
+                    builder.check_fee(Some(fee), Some(FeeRate::from_sat_per_kwu(0)))
+                }
+                FeePolicy::FeeAmount(fee) => builder.check_fee(Some(fee), None),
+                FeePolicy::FeeRate(feerate) => builder.check_fee(None, Some(feerate)),
+            }
+        }
+
+        // add inputs
+        for weighted_utxo in selection {
+            let txout = weighted_utxo.utxo.txout().clone();
+            match weighted_utxo.utxo {
+                Utxo::Local(output) => {
+                    let plan = plan_utxos
+                        .get(&output.outpoint)
+                        .cloned()
+                        .expect("local outputs must be planned");
+                    builder.add_input(bdk_tx::PlanUtxo {
+                        plan,
+                        outpoint: output.outpoint,
+                        txout: output.txout,
+                    });
+                }
+                Utxo::Foreign {
+                    outpoint,
+                    sequence,
+                    psbt_input,
+                } => {
+                    if !txout.script_pubkey.is_p2tr()
+                        && !params.only_witness_utxo
+                        && psbt_input.non_witness_utxo.is_none()
+                    {
+                        return Err(BuildPsbtError::CreateTx(
+                            CreateTxError::MissingNonWitnessUtxo(outpoint),
+                        ));
+                    }
+                    builder.add_psbt_input(
+                        outpoint,
+                        weighted_utxo.satisfaction_weight,
+                        Some(sequence),
+                        psbt_input,
+                    )?
+                }
+            }
+        }
+
+        let tx_weight = builder.estimate_weight();
+
+        // build psbt
+        let mut provider = Provider {
+            wallet: self,
+            tx_order: (params.ordering.clone(), rng),
+        };
+        let mut updater = builder.build_psbt(&mut provider)?;
+        let opt = UpdateOptions {
+            only_witness_utxo: params.only_witness_utxo,
+            sighash_type: params.sighash,
+            update_with_descriptor: params.update_with_descriptor,
+        };
+        updater
+            .update_psbt(&provider, opt)
+            .map_err(bdk_tx::Error::Update)?;
+
+        if params.add_global_xpubs {
+            let all_xpubs = self
+                .keychains()
+                .flat_map(|(_, desc)| desc.get_extended_keys())
+                .collect::<Vec<_>>();
+
+            for xpub in all_xpubs {
+                let origin = match xpub.origin {
+                    Some(origin) => origin,
+                    None if xpub.xkey.depth == 0 => {
+                        (xpub.root_fingerprint(&self.secp), vec![].into())
+                    }
+                    _ => {
+                        return Err(BuildPsbtError::CreateTx(CreateTxError::MissingKeyOrigin(
+                            xpub.xkey.to_string(),
+                        )))
+                    }
+                };
+
+                updater.add_global_xpub(xpub.xkey, origin);
+            }
+        }
+
+        // Now that we have the fee and feerate of the tx, apply RBF rules
+        // 3 and 4 to the replacement
+        let fee = updater.psbt().fee()?;
+        let feerate = fee / tx_weight;
+        if is_rbf {
+            // The replacement must pay a higher absolute fee
+            if fee < bumping_fee {
+                return Err(BuildPsbtError::CreateTx(CreateTxError::FeeTooLow {
+                    required: bumping_fee,
+                }));
+            }
+            // The replacement must pay for its bandwidth at a rate 1 sat/vb
+            let required = FeeRate::from_sat_per_kwu(
+                bumping_feerate.to_sat_per_kwu() + FeeRate::BROADCAST_MIN.to_sat_per_kwu(),
+            );
+            if feerate < required {
+                return Err(BuildPsbtError::CreateTx(CreateTxError::FeeRateTooLow {
+                    required,
+                }));
+            }
+        }
+
+        // If we added change we reveal the change address
+        if drain.is_some() {
+            if let Some(index) = drain_index {
+                let _ = self.reveal_addresses_to(change_keychain, index);
+                // ..and we mark it used
+                self.mark_used(change_keychain, index);
+            }
+        }
+
+        Ok(updater.into_finalizer())
+    }
+}
+
 impl AsRef<bdk_chain::tx_graph::TxGraph<ConfirmationBlockTime>> for Wallet {
     fn as_ref(&self) -> &bdk_chain::tx_graph::TxGraph<ConfirmationBlockTime> {
         self.indexed_graph.graph()
@@ -2601,6 +2979,7 @@ mod test {
 
         let mut params = TxParams::default();
         let output = wallet.get_utxo(OutPoint { txid, vout: 0 }).unwrap();
+        // enforce selection of first output in transaction
         params.utxos.insert(
             output.outpoint,
             WeightedUtxo {
@@ -2611,20 +2990,12 @@ mod test {
                 utxo: Utxo::Local(output),
             },
         );
-        // enforce selection of first output in transaction
-        let received = wallet.filter_utxos(&params, wallet.latest_checkpoint().block_id().height);
+        let received: Vec<LocalOutput> = wallet
+            .filter_utxos(&params, wallet.latest_checkpoint().block_id().height)
+            .collect();
         // notice expected doesn't include the first output from two_output_tx as it should be
         // filtered out
-        let expected = vec![wallet
-            .get_utxo(OutPoint { txid, vout: 1 })
-            .map(|utxo| WeightedUtxo {
-                satisfaction_weight: wallet
-                    .public_descriptor(utxo.keychain)
-                    .max_weight_to_satisfy()
-                    .unwrap(),
-                utxo: Utxo::Local(utxo),
-            })
-            .unwrap()];
+        let expected = vec![wallet.get_utxo(OutPoint { txid, vout: 1 }).unwrap()];
 
         assert_eq!(expected, received);
     }

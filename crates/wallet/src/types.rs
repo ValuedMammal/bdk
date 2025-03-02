@@ -10,11 +10,12 @@
 // licenses.
 
 use alloc::boxed::Box;
-use chain::{ChainPosition, ConfirmationBlockTime};
 use core::convert::AsRef;
 
+use bdk_coin_select::Candidate;
 use bitcoin::transaction::{OutPoint, Sequence, TxOut};
 use bitcoin::{psbt, Weight};
+use chain::{ChainPosition, ConfirmationBlockTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +76,27 @@ pub struct WeightedUtxo {
     pub satisfaction_weight: Weight,
     /// The UTXO
     pub utxo: Utxo,
+}
+
+impl WeightedUtxo {
+    /// Get the corresponding [`LocalOutput`] if this UTXO contains one
+    pub(crate) fn local_output(&self) -> Option<&LocalOutput> {
+        match &self.utxo {
+            Utxo::Local(output) => Some(output),
+            Utxo::Foreign { .. } => None,
+        }
+    }
+}
+
+impl From<WeightedUtxo> for Candidate {
+    fn from(u: WeightedUtxo) -> Self {
+        Self {
+            input_count: 1,
+            weight: u.satisfaction_weight.to_wu(),
+            value: u.utxo.txout().value.to_sat(),
+            is_segwit: u.utxo.txout().script_pubkey.witness_version().is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
