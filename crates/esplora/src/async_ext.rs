@@ -224,31 +224,35 @@ async fn chain_update<S: Sleeper>(
     local_tip: &CheckPoint,
     anchors: &BTreeSet<(ConfirmationBlockTime, Txid)>,
 ) -> Result<CheckPoint, Error> {
-    let mut cp = local_tip.clone();
+    let mut point_of_agreement = None;
+    let mut local_cp_hash = local_tip.hash();
     let mut conflicts = vec![];
 
-    let mut tip = loop {
-        let remote_hash = match fetch_block(client, latest_blocks, cp.height()).await? {
+    for local_cp in local_tip.iter() {
+        let remote_hash = match fetch_block(client, latest_blocks, local_cp.height()).await? {
             Some(hash) => hash,
             None => continue,
         };
-        if remote_hash == cp.hash() {
-            break cp;
+        if remote_hash == local_cp.hash() {
+            point_of_agreement = Some(local_cp);
+            break;
         }
-        // it is not strictly necessary to include all the conflicted heights (we do need the
+        local_cp_hash = local_cp.hash();
+        // It is not strictly necessary to include all the conflicted heights (we do need the
         // first one) but it seems prudent to make sure the updated chain's heights are a
         // superset of the existing chain after update.
         conflicts.push(BlockId {
-            height: cp.height(),
+            height: local_cp.height(),
             hash: remote_hash,
         });
-        cp = match cp.prev() {
-            Some(prev) => prev,
-            None => {
-                return Err(Box::new(esplora_client::Error::HeaderHashNotFound(
-                    cp.hash(),
-                )));
-            }
+    }
+
+    let mut tip = match point_of_agreement {
+        Some(tip) => tip,
+        None => {
+            return Err(Box::new(esplora_client::Error::HeaderHashNotFound(
+                local_cp_hash,
+            )));
         }
     };
 
