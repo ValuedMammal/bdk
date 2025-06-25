@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "example_cli",
+    "example_electrum",
+    "example_esplora",
+    "example_bitcoind_rpc_polling",
+]
+
+[workspace.package]
+authors = ["Bitcoin Dev Kit Developers"]
+
+[workspace.lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
