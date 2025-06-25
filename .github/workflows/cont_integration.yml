@@ -62,11 +62,11 @@ jobs:
           MATRIX_RUST_VERSION: ${{ matrix.rust.version }}
         run: |
           if [ $MATRIX_RUST_VERSION = '1.63.0' ]; then
-            cargo build --workspace --exclude 'example_*' --exclude 'bdk_electrum' ${{ matrix.features }}
-            cargo test --workspace --exclude 'example_*' --exclude 'bdk_electrum' ${{ matrix.features }}
+            cargo build --workspace --exclude 'bdk_electrum' ${{ matrix.features }}
+            cargo test --workspace --exclude 'bdk_electrum' ${{ matrix.features }}
           else
-            cargo build --workspace --exclude 'example_*' ${{ matrix.features }}
-            cargo test --workspace --exclude 'example_*' ${{ matrix.features }}
+            cargo build --workspace ${{ matrix.features }}
+            cargo test --workspace ${{ matrix.features }}
           fi
 
   check-no-std:
@@ -170,13 +170,6 @@ jobs:
     needs: prepare
     name: Build & Test Examples
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        example-dir:
-          - example_cli
-          - example_bitcoind_rpc_polling
-          - example_electrum
-          - example_esplora
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -191,5 +184,5 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2.7.8
       - name: Build
-        working-directory: examples/${{ matrix.example-dir }}
-        run: cargo build
+        working-directory: examples
+        run: cargo build --workspace
