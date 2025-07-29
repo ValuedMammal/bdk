@@ -51,8 +51,23 @@ jobs:
         env:
           MATRIX_RUST_VERSION: ${{ matrix.rust.version }}
         run: |
-          cargo build --workspace ${{ matrix.features }}
-          cargo test --workspace ${{ matrix.features }}
+          cargo check --workspace ${{ matrix.features }}
+          
+          # Test library packages
+          echo 'Test core'
+          cargo test -p bdk_core --all-features || exit 1
+          echo 'Test chain'
+          cargo test -p bdk_chain --all-features || exit 1
+          echo 'Test testenv'
+          cargo test -p bdk_testenv --all-features -- --test-threads=1 || exit 1
+          echo 'Test bitcoind_rpc'
+          cargo test -p bdk_bitcoind_rpc --all-features -- --test-threads=1 || exit 1
+          echo 'Test electrum'
+          cargo test -p bdk_electrum --all-features -- --test-threads=1 || exit 1
+          echo 'Test esplora'
+          cargo test -p bdk_esplora --all-features -- --test-threads=1 || exit 1
+          echo 'Test file_store'
+          cargo test -p bdk_file_store --all-features || exit 1
 
   check-no-std:
     needs: prepare
