@@ -219,7 +219,7 @@ fn insert_relevant_txs() {
     let (descriptor, _) = Descriptor::parse_descriptor(&Secp256k1::signing_only(), DESCRIPTORS[0])
         .expect("must be valid");
     let spk_0 = descriptor.at_derivation_index(0).unwrap().script_pubkey();
-    let spk_1 = descriptor.at_derivation_index(9).unwrap().script_pubkey();
+    let spk_9 = descriptor.at_derivation_index(9).unwrap().script_pubkey();
     let lookahead = 10;
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, KeychainTxOutIndex<()>>::new({
@@ -237,7 +237,7 @@ fn insert_relevant_txs() {
             },
             TxOut {
                 value: Amount::from_sat(20_000),
-                script_pubkey: spk_1,
+                script_pubkey: spk_9,
             },
         ],
         ..new_tx(0)
@@ -269,12 +269,12 @@ fn insert_relevant_txs() {
         indexer: keychain_txout::ChangeSet {
             last_revealed: [(descriptor.descriptor_id(), 9_u32)].into(),
             spk_cache: [(descriptor.descriptor_id(), {
-                let index_after_spk_1 = 9 /* index of spk_1 */ + 1;
+                let index_after_spk_9 = 9 /* index of spk_9 */ + 1;
                 SpkIterator::new_with_range(
                     &descriptor,
                     // This will also persist the staged spk cache inclusions from prev call to
                     // `.insert_descriptor`.
-                    0..index_after_spk_1 + lookahead,
+                    index_after_spk_9..index_after_spk_9 + lookahead,
                 )
                 .collect()
             })]
@@ -294,7 +294,7 @@ fn insert_relevant_txs() {
             last_revealed: changeset.indexer.last_revealed,
             spk_cache: [(
                 descriptor.descriptor_id(),
-                SpkIterator::new_with_range(&descriptor, 0..=9 /* index of spk_1*/  + lookahead)
+                SpkIterator::new_with_range(&descriptor, 0..=9 /* index of spk_9*/  + lookahead)
                     .collect(),
             )]
             .into(),
