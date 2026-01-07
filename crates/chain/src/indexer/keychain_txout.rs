@@ -434,15 +434,34 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
     ) -> Result<bool, InsertDescriptorError<K>> {
+        self.insert_descriptor_derived(keychain, descriptor)
+            .map(|(inserted, _cs)| inserted)
+    }
+
+    /// Insert descriptor and store [`Self::lookahead`] number of script pubkeys (SPKs) ahead of
+    /// time.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(bool, ChangeSet)` where the first item indicates whether the descriptor
+    /// was newly inserted. Note that if `Self::persist_spks == true`, the `spk_cache` field
+    /// of the returned changeset is populated with the derived scripts, and empty otherwise.
+    pub fn insert_descriptor_derived(
+        &mut self,
+        keychain: K,
+        descriptor: Descriptor<DescriptorPublicKey>,
+    ) -> Result<(bool, ChangeSet), InsertDescriptorError<K>> {
         let did = descriptor.descriptor_id();
+
         if !self.keychain_to_descriptor_id.contains_key(&keychain)
             && !self.descriptor_id_to_keychain.contains_key(&did)
         {
             self.descriptors.insert(did, descriptor.clone());
             self.keychain_to_descriptor_id.insert(keychain.clone(), did);
             self.descriptor_id_to_keychain.insert(did, keychain.clone());
-            self.replenish_inner_index(did, &keychain, self.lookahead, &mut ChangeSet::default());
-            return Ok(true);
+            let mut changeset = ChangeSet::default();
+            self.replenish_inner_index(did, &keychain, self.lookahead, &mut changeset);
+            return Ok((true, changeset));
         }
 
         if let Some(existing_desc_id) = self.keychain_to_descriptor_id.get(&keychain) {
@@ -466,7 +485,7 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
             }
         }
 
-        Ok(false)
+        Ok((false, ChangeSet::default()))
     }
 
     /// Gets the descriptor associated with the keychain. Returns `None` if the keychain doesn't
