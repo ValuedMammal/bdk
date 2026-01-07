@@ -581,13 +581,12 @@ impl<K: Clone + Ord + Debug> KeychainTxOutIndex<K> {
             };
             let cached_spk_iter = core::iter::from_fn({
                 let spk_cache = self.spk_cache.entry(did).or_default();
-                let _i = &mut next_index;
                 move || -> Option<Indexed<ScriptBuf>> {
-                    if *_i >= stop_index {
+                    if next_index >= stop_index {
                         return None;
                     }
-                    let spk_i = *_i;
-                    *_i = spk_i.saturating_add(1);
+                    let spk_i = next_index;
+                    next_index = next_index.saturating_add(1);
 
                     if let Some(spk) = spk_cache.get(&spk_i) {
                         debug_assert_eq!(spk, &derive_spk(spk_i), "cached spk must equal derived");
