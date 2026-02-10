@@ -272,8 +272,6 @@ fn insert_relevant_txs() {
                 let index_after_spk_9 = 9 /* index of spk_9 */ + 1;
                 SpkIterator::new_with_range(
                     &descriptor,
-                    // This will also persist the staged spk cache inclusions from prev call to
-                    // `.insert_descriptor`.
                     index_after_spk_9..index_after_spk_9 + lookahead,
                 )
                 .collect()
