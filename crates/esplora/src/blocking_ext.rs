@@ -187,7 +187,6 @@ impl EsploraExt for esplora_client::BlockingClient {
 /// block-based chain-sources). Therefore it's better to be conservative when setting the tip (use
 /// an earlier tip rather than a later tip) otherwise the caller may accidentally skip blocks when
 /// alternating between chain-sources.
-#[allow(deprecated)]
 fn fetch_latest_blocks(
     client: &esplora_client::BlockingClient,
 ) -> Result<BTreeMap<u32, BlockHash>, Error> {
