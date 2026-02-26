@@ -49,8 +49,8 @@ jobs:
         env:
           MATRIX_RUST_VERSION: ${{ matrix.rust.version }}
         run: |
-            cargo build --workspace --exclude 'example_*' ${{ matrix.features }}
-            cargo test --workspace --exclude 'example_*' ${{ matrix.features }}
+            cargo build --workspace ${{ matrix.features }}
+            cargo test --workspace  ${{ matrix.features }}
 
   check-no-std:
     needs: prepare
