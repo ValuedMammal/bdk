@@ -21,6 +21,7 @@ electrum-client = { version = "0.24.0", features = [ "proxy" ], default-features
 bdk_testenv = { path = "../testenv" }
 bdk_chain = { path = "../chain" }
 criterion = { version = "0.7" }
+bdk_electrum = { path = ".", default-features = true }
 
 [features]
 default = ["use-rustls"]
