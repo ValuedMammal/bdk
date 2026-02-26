@@ -31,7 +31,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     /// Creates a new bdk client from a [`electrum_client::ElectrumApi`]
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
     /// use bdk_electrum::{electrum_client, BdkElectrumClient};
     ///
     /// let client = electrum_client::Client::new("ssl://electrum.blockstream.info:50002")?;
@@ -117,7 +117,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     ///   transaction graph.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
     /// use bdk_core::{spk_client::FullScanRequest, CheckPoint};
     /// use bdk_electrum::BdkElectrumClient;
     /// # use bdk_electrum::electrum_client;
@@ -220,7 +220,7 @@ impl<E: ElectrumApi> BdkElectrumClient<E> {
     /// may include scripts that have been used, use [`full_scan`] with the keychain.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
     /// use bdk_core::bitcoin::ScriptBuf;
     /// use bdk_core::spk_client::SyncRequest;
     /// use bdk_electrum::BdkElectrumClient;
