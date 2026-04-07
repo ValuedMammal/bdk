@@ -1,13 +1,10 @@
 //! The [`LocalChain`] is a local chain of checkpoints.
 
-use core::convert::Infallible;
 use core::fmt;
 use core::ops::RangeBounds;
 
 use crate::collections::BTreeMap;
-use crate::{
-    Anchor, BlockId, CanonicalParams, CanonicalTxs, CanonicalView, ChainOracle, Merge, TxGraph,
-};
+use crate::{Anchor, BlockId, CanonicalParams, CanonicalTxs, CanonicalView, Merge, TxGraph};
 use bdk_core::ToBlockHash;
 pub use bdk_core::{CheckPoint, CheckPointIter};
 use bitcoin::block::Header;
@@ -71,32 +68,29 @@ impl<D> PartialEq for LocalChain<D> {
     }
 }
 
-impl<D> ChainOracle for LocalChain<D> {
-    type Error = Infallible;
-
-    fn is_block_in_chain(
-        &self,
-        block: BlockId,
-        chain_tip: BlockId,
-    ) -> Result<Option<bool>, Self::Error> {
+impl<D> LocalChain<D> {
+    /// Check if a block is in the chain.
+    ///
+    /// # Arguments
+    /// * `block` - The block to check
+    /// * `chain_tip` - The chain tip to check against
+    ///
+    /// # Returns
+    /// * `Some(true)` if the block is in the chain
+    /// * `Some(false)` if the block is not in the chain
+    /// * `None` if it cannot be determined
+    pub fn is_block_in_chain(&self, block: BlockId, chain_tip: BlockId) -> Option<bool> {
         let chain_tip_cp = match self.tip.get(chain_tip.height) {
             // we can only determine whether `block` is in chain of `chain_tip` if `chain_tip` can
             // be identified in chain
             Some(cp) if cp.hash() == chain_tip.hash => cp,
-            _ => return Ok(None),
+            _ => return None,
         };
-        match chain_tip_cp.get(block.height) {
-            Some(cp) => Ok(Some(cp.hash() == block.hash)),
-            None => Ok(None),
-        }
+        chain_tip_cp
+            .get(block.height)
+            .map(|cp| cp.hash() == block.hash)
     }
 
-    fn get_chain_tip(&self) -> Result<BlockId, Self::Error> {
-        Ok(self.tip.block_id())
-    }
-}
-
-impl<D> LocalChain<D> {
     /// Get the chain tip.
     ///
     /// # Returns
@@ -128,9 +122,11 @@ impl<D> LocalChain<D> {
     ) -> CanonicalTxs<'g, A> {
         let chain_tip = task.tip();
         while let Some(request) = task.next_query() {
-            task.resolve_query(request.into_iter().find(|&block_id| {
-                matches!(self.is_block_in_chain(block_id, chain_tip), Ok(Some(true)))
-            }));
+            task.resolve_query(
+                request
+                    .into_iter()
+                    .find(|&block_id| self.is_block_in_chain(block_id, chain_tip) == Some(true)),
+            );
         }
         task.finish()
     }
