@@ -1,11 +1,13 @@
-//! The [`LocalChain`] is a local implementation of [`ChainOracle`].
+//! The [`LocalChain`] is a local chain of checkpoints.
 
 use core::convert::Infallible;
 use core::fmt;
 use core::ops::RangeBounds;
 
 use crate::collections::BTreeMap;
-use crate::{BlockId, ChainOracle, Merge};
+use crate::{
+    Anchor, BlockId, CanonicalParams, CanonicalTxs, CanonicalView, ChainOracle, Merge, TxGraph,
+};
 use bdk_core::ToBlockHash;
 pub use bdk_core::{CheckPoint, CheckPointIter};
 use bitcoin::block::Header;
@@ -57,7 +59,7 @@ where
     Ok(init_cp)
 }
 
-/// This is a local implementation of [`ChainOracle`].
+/// A local chain of checkpoints.
 #[derive(Debug, Clone)]
 pub struct LocalChain<D = BlockHash> {
     tip: CheckPoint<D>,
@@ -91,6 +93,63 @@ impl<D> ChainOracle for LocalChain<D> {
 
     fn get_chain_tip(&self) -> Result<BlockId, Self::Error> {
         Ok(self.tip.block_id())
+    }
+}
+
+impl<D> LocalChain<D> {
+    /// Get the chain tip.
+    ///
+    /// # Returns
+    /// The [`BlockId`] of the chain tip.
+    pub fn chain_tip(&self) -> BlockId {
+        self.tip.block_id()
+    }
+
+    /// Canonicalize a transaction graph using this chain.
+    ///
+    /// Drives the [`CanonicalTask`](crate::CanonicalTask) to completion by answering all
+    /// anchor verification queries, then returns the resulting [`CanonicalTxs`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use bdk_chain::{CanonicalTask, CanonicalParams, TxGraph, local_chain::LocalChain};
+    /// # use bdk_core::BlockId;
+    /// # use bitcoin::hashes::Hash;
+    /// # let tx_graph: TxGraph<BlockId> = TxGraph::default();
+    /// # let chain = LocalChain::from_blocks([(0, bitcoin::BlockHash::all_zeros())].into_iter().collect()).unwrap();
+    /// let chain_tip = chain.tip().block_id();
+    /// let task = CanonicalTask::new(&tx_graph, chain_tip, CanonicalParams::default());
+    /// let view = chain.canonicalize(task);
+    /// ```
+    pub fn canonicalize<'g, A: Anchor>(
+        &self,
+        mut task: crate::CanonicalTask<'g, A>,
+    ) -> CanonicalTxs<'g, A> {
+        let chain_tip = task.tip();
+        while let Some(request) = task.next_query() {
+            task.resolve_query(request.into_iter().find(|&block_id| {
+                matches!(self.is_block_in_chain(block_id, chain_tip), Ok(Some(true)))
+            }));
+        }
+        task.finish()
+    }
+
+    /// Convenience method that canonicalizes a transaction graph and returns a [`CanonicalView`].
+    ///
+    /// This is equivalent to:
+    /// ```ignore
+    /// let canonical_txs = chain.canonicalize(tx_graph.canonical_task(tip, params));
+    /// let view = canonical_txs.view();
+    /// ```
+    pub fn canonical_view<A: Anchor>(
+        &self,
+        tx_graph: &TxGraph<A>,
+        tip: BlockId,
+        params: CanonicalParams,
+    ) -> CanonicalView<A> {
+        self.canonicalize(tx_graph.canonical_task(tip, params))
+            .view()
     }
 }
 

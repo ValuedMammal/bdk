@@ -66,7 +66,8 @@ pub struct CanonicalTask<'g, A> {
     unprocessed_anchored_txs: VecDeque<(Txid, Arc<Transaction>, &'g BTreeSet<A>)>,
     unprocessed_seen_txs: Box<dyn Iterator<Item = (Txid, Arc<Transaction>, u64)> + 'g>,
 
-    /// txs that have anchors but none were found to exist in the best chain
+    /// Txs with anchors that weren't found to exist in the best chain.
+    /// They may have been observed in a block that is now stale.
     unprocessed_leftover_txs: VecDeque<(Txid, Arc<Transaction>, u32)>,
 
     canonical: CanonicalMap<A>,
