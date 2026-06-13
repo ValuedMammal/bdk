@@ -158,3 +158,38 @@ jobs:
           cache: true
       - name: Check docs
         run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
+
+  test-electrum-arm64:
+    needs: prepare
+    name: Test electrum + esplora (arm64)
+    runs-on: ubuntu-24.04-arm
+    env:
+      ELECTRS_COMMIT: 027e38d3ebc2f85b28ae76f8f3448438ee4fc7b1
+      ELECTRS_RELEASE_REPO: ValuedMammal/electrs-arm64
+      ELECTRS_RELEASE_TAG: electrs-bins
+      ELECTRSD_SKIP_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ needs.prepare.outputs.rust_version }}
+          override: true
+          cache: true
+      - name: Download prebuilt electrs binary
+        run: |
+          curl -fL \
+            "https://github.com/${ELECTRS_RELEASE_REPO}/releases/download/${ELECTRS_RELEASE_TAG}/electrs_aarch64_linux_esplora_${ELECTRS_COMMIT}" \
+            -o "$RUNNER_TEMP/electrs"
+          chmod +x "$RUNNER_TEMP/electrs"
+      - name: Test bdk_electrum
+        run: cargo test -p bdk_electrum --features use-rustls
+        env:
+          ELECTRS_EXE: ${{ runner.temp }}/electrs
+      - name: Test bdk_esplora
+        run: cargo test -p bdk_esplora
+        env:
+          ELECTRS_EXE: ${{ runner.temp }}/electrs
