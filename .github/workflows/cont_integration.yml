@@ -159,9 +159,9 @@ jobs:
       - name: Check docs
         run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 
-  test-electrum-arm64:
+  build-test-arm64:
     needs: prepare
-    name: Test electrum + esplora (arm64)
+    name: Build & Test (arm64)
     runs-on: ubuntu-24.04-arm
     env:
       ELECTRS_COMMIT: 027e38d3ebc2f85b28ae76f8f3448438ee4fc7b1
@@ -184,7 +184,5 @@ jobs:
           unzip electrs.zip
           echo "ELECTRS_EXE=$PWD/electrs" >> "$GITHUB_ENV"
           echo "ELECTRSD_SKIP_DOWNLOAD=1" >> "$GITHUB_ENV"
-      - name: Test bdk_electrum
-        run: cargo test -p bdk_electrum --features use-rustls
-      - name: Test bdk_esplora
-        run: cargo test -p bdk_esplora
+      - name: Build + Test
+        run: cargo test --workspace --all-features
