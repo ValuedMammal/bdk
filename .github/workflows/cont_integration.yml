@@ -165,9 +165,6 @@ jobs:
     runs-on: ubuntu-24.04-arm
     env:
       ELECTRS_COMMIT: 027e38d3ebc2f85b28ae76f8f3448438ee4fc7b1
-      ELECTRS_RELEASE_REPO: ValuedMammal/electrs-arm64
-      ELECTRS_RELEASE_TAG: electrs-bins
-      ELECTRSD_SKIP_DOWNLOAD: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -179,17 +176,15 @@ jobs:
           toolchain: ${{ needs.prepare.outputs.rust_version }}
           override: true
           cache: true
-      - name: Download prebuilt electrs binary
+      - name: Download electrs (arm64)
         run: |
           curl -fL \
-            "https://github.com/${ELECTRS_RELEASE_REPO}/releases/download/${ELECTRS_RELEASE_TAG}/electrs_aarch64_linux_esplora_${ELECTRS_COMMIT}" \
-            -o "$RUNNER_TEMP/electrs"
-          chmod +x "$RUNNER_TEMP/electrs"
+            "https://github.com/ValuedMammal/electrs-arm64/releases/download/electrs-bins/electrs_aarch64_linux_esplora_${ELECTRS_COMMIT}.zip" \
+            -o electrs.zip
+          unzip electrs.zip
+          echo "ELECTRS_EXE=$PWD/electrs" >> "$GITHUB_ENV"
+          echo "ELECTRSD_SKIP_DOWNLOAD=1" >> "$GITHUB_ENV"
       - name: Test bdk_electrum
         run: cargo test -p bdk_electrum --features use-rustls
-        env:
-          ELECTRS_EXE: ${{ runner.temp }}/electrs
       - name: Test bdk_esplora
         run: cargo test -p bdk_esplora
-        env:
-          ELECTRS_EXE: ${{ runner.temp }}/electrs
